@@ -383,6 +383,11 @@ fn render_pads(board: &Board, out: &mut String) {
     for comp in &board.components {
         if let Some(ref fp) = comp.footprint_data {
             for pad in &fp.pads {
+                // Skip paste-only helper pads (no Cu layers)
+                if !pad.layers.iter().any(|l| l.contains("Cu")) {
+                    continue;
+                }
+
                 let (rx, ry) = rotate_point(pad.at_x, pad.at_y, comp.rotation);
                 let px = comp.x + rx;
                 let py = comp.y + ry;
@@ -406,8 +411,10 @@ fn render_pads(board: &Board, out: &mut String) {
                 );
 
                 // Determine color based on pad type/layers
-                let is_front = pad.layers.iter().any(|l| l.contains("F.Cu"));
-                let is_back = pad.layers.iter().any(|l| l.contains("B.Cu"));
+                // Handle wildcard layers: "*.Cu" means all copper layers (through-hole)
+                let has_wildcard_cu = pad.layers.iter().any(|l| l == "*.Cu");
+                let is_front = has_wildcard_cu || pad.layers.iter().any(|l| l == "F.Cu");
+                let is_back = has_wildcard_cu || pad.layers.iter().any(|l| l == "B.Cu");
                 let color = if is_front && is_back {
                     "#c8a84e" // through-hole: gold
                 } else if is_front {

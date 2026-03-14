@@ -6,6 +6,99 @@ use uuid::Uuid;
 use crate::router::RoutedNet;
 use crate::schema::{Board, Component, Layer};
 
+// Placement constraints
+const MIN_COURTYARD_CLEARANCE: f64 = 0.5; // mm, minimum gap between component courtyards
+// Stitching via parameters
+const STITCHING_VIA_SPACING: f64 = 10.0; // mm, grid spacing
+const STITCHING_VIA_SIZE: f64 = 0.6; // mm
+const STITCHING_VIA_DRILL: f64 = 0.3; // mm
+const STITCHING_VIA_MARGIN: f64 = 3.0; // mm, margin from board edge
+
+/// Check if a component is a protection device (TVS, ESD, Zener)
+fn is_protection_component(comp: &Component) -> bool {
+    let ref_lower = comp.ref_des.to_lowercase();
+    let val_lower = comp.value.to_lowercase();
+    let desc_lower = comp
+        .description
+        .as_deref()
+        .unwrap_or("")
+        .to_lowercase();
+
+    let is_diode_ref = ref_lower.starts_with('d');
+    let has_protection_keyword = val_lower.contains("tvs")
+        || val_lower.contains("esd")
+        || val_lower.contains("zener")
+        || val_lower.contains("protection")
+        || desc_lower.contains("tvs")
+        || desc_lower.contains("esd")
+        || desc_lower.contains("protection");
+
+    (is_diode_ref && has_protection_keyword) || has_protection_keyword
+}
+
+/// Check if a component is a decoupling/bypass capacitor (100nF)
+fn is_decoupling_cap(comp: &Component) -> bool {
+    let ref_lower = comp.ref_des.to_lowercase();
+    let val_lower = comp.value.to_lowercase().replace(' ', "");
+    let fp_lower = comp.footprint.to_lowercase();
+
+    let is_cap = ref_lower.starts_with('c') || fp_lower.contains("capacitor");
+    let is_100nf = val_lower == "100nf"
+        || val_lower == "0.1uf"
+        || val_lower == "100n"
+        || val_lower == "0.1μf";
+
+    is_cap && is_100nf
+}
+
+/// Check if a component is a connector
+fn is_connector_component(comp: &Component) -> bool {
+    let fp_lower = comp.footprint.to_lowercase();
+    fp_lower.contains("connector") || fp_lower.contains("usb") || fp_lower.contains("jst")
+}
+
+/// Check if a component is an IC (multi-pin active device)
+fn is_ic_component(comp: &Component) -> bool {
+    let fp_lower = comp.footprint.to_lowercase();
+    comp.pins.len() > 4
+        && !is_connector_component(comp)
+        && !fp_lower.contains("capacitor")
+        && !fp_lower.contains("resistor")
+        && !fp_lower.contains("inductor")
+        && !fp_lower.contains("led")
+        && !fp_lower.contains("button")
+        && !fp_lower.contains("switch")
+        && !fp_lower.contains("diode")
+}
+
+/// Check if a net name is a VCC/power supply net (excluding GND)
+fn is_vcc_net(name: &str) -> bool {
+    let upper = name.to_uppercase();
+    upper.starts_with("VCC")
+        || upper.starts_with("VDD")
+        || upper.starts_with("V3V3")
+        || upper == "3V3"
+        || upper == "5V"
+}
+
+/// Compute component sizes for placement with minimum courtyard clearance
+fn compute_placement_sizes(components: &[Component]) -> Vec<(f64, f64)> {
+    components
+        .iter()
+        .map(|c| {
+            if let Some(fp) = &c.footprint_data {
+                let (min_x, min_y, max_x, max_y) = fp.placement_bounds();
+                (
+                    max_x - min_x + 2.0 * MIN_COURTYARD_CLEARANCE,
+                    max_y - min_y + 2.0 * MIN_COURTYARD_CLEARANCE,
+                )
+            } else {
+                (12.0, 8.0)
+            }
+        })
+        .collect()
+}
+
 pub fn generate_pcb(board: &mut Board, output: &Path) -> Result<()> {
     // Step 1: Place components using connectivity-aware algorithm
     place_components(board);
@@ -19,6 +112,7 @@ pub fn generate_pcb(board: &mut Board, output: &Path) -> Result<()> {
     write_board_outline(&mut buf, board);
     write_components(&mut buf, board);
     write_zones(&mut buf, board);
+    write_stitching_vias(&mut buf, board);
     buf.push_str(")\n");
 
     let mut file = std::fs::File::create(output)?;
@@ -55,19 +149,8 @@ fn place_components(board: &mut Board) {
         }
     }
 
-    // 2. Get component sizes for placement (use fab/pad bounds, not courtyard which includes keepouts)
-    let sizes: Vec<(f64, f64)> = board
-        .components
-        .iter()
-        .map(|c| {
-            if let Some(fp) = &c.footprint_data {
-                let (min_x, min_y, max_x, max_y) = fp.placement_bounds();
-                (max_x - min_x + 2.0, max_y - min_y + 2.0)
-            } else {
-                (12.0, 8.0)
-            }
-        })
-        .collect();
+    // 2. Get component sizes for placement (with courtyard clearance)
+    let sizes = compute_placement_sizes(&board.components);
 
     // 3. Find most connected component → place at center
     let total_conn: Vec<usize> = (0..n).map(|i| adj[i].iter().sum()).collect();
@@ -136,6 +219,11 @@ fn place_components(board: &mut Board) {
         }
     }
 
+    // 6. Post-placement: move protection components near their connected connectors
+    post_place_protection_near_connectors(board);
+
+    // 7. Post-placement: move decoupling capacitors near their connected ICs
+    post_place_decoupling_near_ics(board);
 }
 
 /// Find a non-overlapping position near (tx, ty) using spiral search.
@@ -255,15 +343,246 @@ fn find_edge_position(
     find_non_overlapping(near_x, near_y, sizes, positions, my_idx, min_x, max_x, min_y, max_y)
 }
 
+/// Post-placement: move protection components (TVS/ESD) adjacent to their connected connectors.
+/// Ensures < 5mm distance and same layer (no via needed).
+fn post_place_protection_near_connectors(board: &mut Board) {
+    let sizes = compute_placement_sizes(&board.components);
+    let margin = 5.0;
+    let n = board.components.len();
+
+    // Collect moves first to avoid borrow issues
+    let mut moves: Vec<(usize, f64, f64)> = Vec::new();
+
+    for idx in 0..n {
+        if !is_protection_component(&board.components[idx]) {
+            continue;
+        }
+
+        let comp_name = board.components[idx].name.clone();
+        let mut best_connector_pos = None;
+        let mut best_dist = f64::MAX;
+
+        for net in &board.nets {
+            if !net.pins.iter().any(|p| p.component == comp_name) {
+                continue;
+            }
+            for pin_ref in &net.pins {
+                if pin_ref.component == comp_name {
+                    continue;
+                }
+                if let Some(conn) = board.components.iter().find(|c| {
+                    c.name == pin_ref.component && is_connector_component(c)
+                }) {
+                    let dist = (conn.x - board.components[idx].x).powi(2)
+                        + (conn.y - board.components[idx].y).powi(2);
+                    if dist < best_dist {
+                        best_dist = dist;
+                        best_connector_pos = Some((conn.x, conn.y));
+                    }
+                }
+            }
+        }
+
+        if let Some((tx, ty)) = best_connector_pos {
+            moves.push((idx, tx, ty));
+        }
+    }
+
+    for (comp_idx, target_x, target_y) in moves {
+        let positions: Vec<Option<(f64, f64)>> = board
+            .components
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                if i == comp_idx {
+                    None
+                } else {
+                    Some((c.x, c.y))
+                }
+            })
+            .collect();
+
+        let (px, py) = find_non_overlapping(
+            target_x,
+            target_y,
+            &sizes,
+            &positions,
+            comp_idx,
+            margin,
+            board.width - margin,
+            margin,
+            board.height - margin,
+        );
+
+        board.components[comp_idx].x = px;
+        board.components[comp_idx].y = py;
+    }
+}
+
+/// Post-placement: move decoupling capacitors (100nF) adjacent to their connected ICs.
+/// Assigns each cap to the closest IC sharing a VCC net, places within 5mm.
+fn post_place_decoupling_near_ics(board: &mut Board) {
+    let sizes = compute_placement_sizes(&board.components);
+    let margin = 5.0;
+    let n = board.components.len();
+
+    let cap_indices: Vec<usize> = (0..n)
+        .filter(|&i| is_decoupling_cap(&board.components[i]))
+        .collect();
+
+    let mut assigned_ics: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut moves: Vec<(usize, f64, f64)> = Vec::new();
+
+    for &cap_idx in &cap_indices {
+        let cap_name = board.components[cap_idx].name.clone();
+
+        // Find ICs sharing a VCC net with this cap
+        let mut candidate_ics: Vec<usize> = Vec::new();
+        for net in &board.nets {
+            if !is_vcc_net(&net.name) {
+                continue;
+            }
+            if !net.pins.iter().any(|p| p.component == cap_name) {
+                continue;
+            }
+            for pin_ref in &net.pins {
+                if pin_ref.component == cap_name {
+                    continue;
+                }
+                if let Some(ic_idx) = board.components.iter().position(|c| {
+                    c.name == pin_ref.component && is_ic_component(c)
+                }) {
+                    if !candidate_ics.contains(&ic_idx) && !assigned_ics.contains(&ic_idx) {
+                        candidate_ics.push(ic_idx);
+                    }
+                }
+            }
+        }
+
+        // Find closest unassigned IC
+        let mut best_ic = None;
+        let mut best_dist = f64::MAX;
+        for &ic_idx in &candidate_ics {
+            let ic = &board.components[ic_idx];
+            let cap = &board.components[cap_idx];
+            let dist = (ic.x - cap.x).powi(2) + (ic.y - cap.y).powi(2);
+            if dist < best_dist {
+                best_dist = dist;
+                best_ic = Some(ic_idx);
+            }
+        }
+
+        if let Some(ic_idx) = best_ic {
+            assigned_ics.insert(ic_idx);
+            let target_x = board.components[ic_idx].x;
+            let target_y = board.components[ic_idx].y;
+            moves.push((cap_idx, target_x, target_y));
+        }
+    }
+
+    for (comp_idx, target_x, target_y) in moves {
+        let positions: Vec<Option<(f64, f64)>> = board
+            .components
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                if i == comp_idx {
+                    None
+                } else {
+                    Some((c.x, c.y))
+                }
+            })
+            .collect();
+
+        let (px, py) = find_non_overlapping(
+            target_x,
+            target_y,
+            &sizes,
+            &positions,
+            comp_idx,
+            margin,
+            board.width - margin,
+            margin,
+            board.height - margin,
+        );
+
+        board.components[comp_idx].x = px;
+        board.components[comp_idx].y = py;
+    }
+}
+
+/// Write GND stitching vias distributed across the board in a regular grid.
+/// Connects F.Cu and B.Cu ground planes every ~10mm, avoiding component areas.
+fn write_stitching_vias(buf: &mut String, board: &Board) {
+    let gnd_idx = match board.nets.iter().position(|n| n.name == "GND") {
+        Some(idx) => idx + 1, // KiCad nets are 1-indexed
+        None => return,
+    };
+
+    let margin = STITCHING_VIA_MARGIN;
+    let mut x = margin;
+    while x < board.width - margin {
+        let mut y = margin;
+        while y < board.height - margin {
+            // Check if position is far enough from all components
+            let too_close = board.components.iter().any(|comp| {
+                if let Some(fp) = &comp.footprint_data {
+                    let (min_x, min_y, max_x, max_y) = fp.placement_bounds();
+                    let abs_min_x = comp.x + min_x - 1.0;
+                    let abs_min_y = comp.y + min_y - 1.0;
+                    let abs_max_x = comp.x + max_x + 1.0;
+                    let abs_max_y = comp.y + max_y + 1.0;
+                    x >= abs_min_x && x <= abs_max_x && y >= abs_min_y && y <= abs_max_y
+                } else {
+                    let dist = ((comp.x - x).powi(2) + (comp.y - y).powi(2)).sqrt();
+                    dist < 3.0
+                }
+            });
+
+            if !too_close {
+                buf.push_str(&format!(
+                    "  (via (at {} {}) (size {}) (drill {}) (layers \"F.Cu\" \"B.Cu\") (net {}) (uuid \"{}\"))\n",
+                    x, y, STITCHING_VIA_SIZE, STITCHING_VIA_DRILL, gnd_idx, Uuid::new_v4()
+                ));
+            }
+
+            y += STITCHING_VIA_SPACING;
+        }
+        x += STITCHING_VIA_SPACING;
+    }
+}
+
 /// Write copper pour zone definitions for power nets.
 fn write_zones(buf: &mut String, board: &Board) {
-    // GND zone on B.Cu (full ground plane)
+    // GND zone on B.Cu — solid ground plane covering the entire board.
+    // connect_pads ensures thermal relief connections; min_thickness prevents fragmentation.
     if let Some(gnd_idx) = board.nets.iter().position(|n| n.name == "GND") {
         buf.push_str(&format!(
             "  (zone (net {}) (net_name \"GND\") (layer \"B.Cu\") (uuid \"{}\")\n",
-            gnd_idx + 1, Uuid::new_v4()
+            gnd_idx + 1,
+            Uuid::new_v4()
         ));
-        buf.push_str("    (fill yes (thermal_gap 0.5) (thermal_bridge_width 0.5))\n");
+        buf.push_str("    (connect_pads (clearance 0.3))\n");
+        buf.push_str(
+            "    (fill yes (thermal_gap 0.5) (thermal_bridge_width 0.5) (min_thickness 0.25) (island_removal_mode 2) (island_area_min 10.0))\n",
+        );
+        buf.push_str(&format!(
+            "    (polygon (pts\n      (xy 0 0) (xy {} 0) (xy {} {}) (xy 0 {})\n    ))\n",
+            board.width, board.width, board.height, board.height
+        ));
+        buf.push_str("  )\n\n");
+
+        // Also add GND zone on F.Cu with lower priority, to help stitching vias
+        buf.push_str(&format!(
+            "  (zone (net {}) (net_name \"GND\") (layer \"F.Cu\") (uuid \"{}\")\n",
+            gnd_idx + 1,
+            Uuid::new_v4()
+        ));
+        buf.push_str("    (connect_pads (clearance 0.3))\n");
+        buf.push_str(
+            "    (fill yes (thermal_gap 0.5) (thermal_bridge_width 0.5) (min_thickness 0.25) (island_removal_mode 2) (island_area_min 10.0))\n",
+        );
+        buf.push_str("    (priority 2)\n");
         buf.push_str(&format!(
             "    (polygon (pts\n      (xy 0 0) (xy {} 0) (xy {} {}) (xy 0 {})\n    ))\n",
             board.width, board.width, board.height, board.height
@@ -275,9 +594,13 @@ fn write_zones(buf: &mut String, board: &Board) {
     if let Some(vcc_idx) = board.nets.iter().position(|n| n.name == "VCC3V3") {
         buf.push_str(&format!(
             "  (zone (net {}) (net_name \"VCC3V3\") (layer \"F.Cu\") (uuid \"{}\")\n",
-            vcc_idx + 1, Uuid::new_v4()
+            vcc_idx + 1,
+            Uuid::new_v4()
         ));
-        buf.push_str("    (fill yes (thermal_gap 0.5) (thermal_bridge_width 0.5))\n");
+        buf.push_str("    (connect_pads (clearance 0.3))\n");
+        buf.push_str(
+            "    (fill yes (thermal_gap 0.5) (thermal_bridge_width 0.5) (min_thickness 0.25))\n",
+        );
         buf.push_str("    (priority 1)\n");
         buf.push_str(&format!(
             "    (polygon (pts\n      (xy 0 0) (xy {} 0) (xy {} {}) (xy 0 {})\n    ))\n",
@@ -432,14 +755,20 @@ fn write_footprint(buf: &mut String, comp: &Component, board: &Board) {
                 String::new()
             };
 
+            let net_line = if net_str.is_empty() {
+                String::new()
+            } else {
+                format!("\n      {}", net_str)
+            };
+
             buf.push_str(&format!(
-                "    (pad \"{}\" {} {} (at {} {}) (size {} {}){}\n      (layers \"{}\")\n      {}\n      (uuid \"{}\")\n    )\n",
+                "    (pad \"{}\" {} {} (at {} {}) (size {} {}){}\n      (layers \"{}\"){}\n      (uuid \"{}\")\n    )\n",
                 pad.number, pad.pad_type, pad.shape,
                 pad.at_x, pad.at_y,
                 pad.size_w, pad.size_h,
                 drill_str,
                 layers_str,
-                net_str,
+                net_line,
                 Uuid::new_v4()
             ));
         }

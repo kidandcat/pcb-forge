@@ -119,6 +119,71 @@ fn is_power_net(name: &str) -> bool {
         || upper.starts_with("VBUS")
 }
 
+/// Check if a net connects critical components that need short, direct traces.
+/// TVS/ESD→connector and decoupling cap→IC connections are routed first.
+fn is_critical_net(net_name: &str, board: &Board) -> bool {
+    let net = match board.nets.iter().find(|n| n.name == net_name) {
+        Some(n) => n,
+        None => return false,
+    };
+
+    let mut has_protection = false;
+    let mut has_connector = false;
+    let mut has_decoupling = false;
+    let mut has_ic = false;
+
+    for pin_ref in &net.pins {
+        if let Some(comp) = board.components.iter().find(|c| c.name == pin_ref.component) {
+            let fp_lower = comp.footprint.to_lowercase();
+            let val_lower = comp.value.to_lowercase().replace(' ', "");
+            let desc_lower = comp.description.as_deref().unwrap_or("").to_lowercase();
+            let ref_lower = comp.ref_des.to_lowercase();
+
+            // Protection component
+            if val_lower.contains("tvs")
+                || val_lower.contains("esd")
+                || val_lower.contains("zener")
+                || desc_lower.contains("protection")
+                || desc_lower.contains("tvs")
+                || desc_lower.contains("esd")
+            {
+                has_protection = true;
+            }
+
+            // Connector
+            if fp_lower.contains("connector")
+                || fp_lower.contains("usb")
+                || fp_lower.contains("jst")
+            {
+                has_connector = true;
+            }
+
+            // Decoupling cap (100nF)
+            let is_100nf = val_lower == "100nf"
+                || val_lower == "0.1uf"
+                || val_lower == "100n";
+            if (ref_lower.starts_with('c') || fp_lower.contains("capacitor")) && is_100nf {
+                has_decoupling = true;
+            }
+
+            // IC (multi-pin active device)
+            if comp.pins.len() > 4
+                && !fp_lower.contains("connector")
+                && !fp_lower.contains("usb")
+                && !fp_lower.contains("jst")
+                && !fp_lower.contains("capacitor")
+                && !fp_lower.contains("resistor")
+                && !fp_lower.contains("led")
+                && !fp_lower.contains("button")
+            {
+                has_ic = true;
+            }
+        }
+    }
+
+    (has_protection && has_connector) || (has_decoupling && has_ic)
+}
+
 fn trace_width_for_net(name: &str) -> f64 {
     if is_power_net(name) {
         TRACE_WIDTH_POWER
@@ -340,12 +405,16 @@ impl Router {
             });
         }
 
-        // Step 4: Sort nets - shorter/simpler first, power last
+        // Step 4: Sort nets — critical first (TVS→connector, decoupling→IC),
+        // then signal nets, then power nets
         net_infos.sort_by(|a, b| {
+            let a_critical = is_critical_net(&a.name, board);
+            let b_critical = is_critical_net(&b.name, board);
             let a_power = is_power_net(&a.name);
             let b_power = is_power_net(&b.name);
-            a_power
-                .cmp(&b_power)
+            b_critical
+                .cmp(&a_critical) // critical nets first (true > false)
+                .then_with(|| a_power.cmp(&b_power)) // power nets last
                 .then_with(|| a.pin_positions.len().cmp(&b.pin_positions.len()))
         });
 

@@ -341,7 +341,16 @@ fn extract_pad(expr: &SExpr) -> Option<PadData> {
         vec![]
     };
 
-    let drill = expr.find("drill").and_then(|d| d.nth_f64(1));
+    let drill = expr.find("drill").and_then(|d| {
+        let items = d.as_list()?;
+        // Handle both (drill 0.75) and (drill oval 0.6 1.2)
+        for item in items.iter().skip(1) {
+            if let Some(v) = item.as_atom().and_then(|s| s.parse::<f64>().ok()) {
+                return Some(v);
+            }
+        }
+        None
+    });
 
     Some(PadData {
         number,
