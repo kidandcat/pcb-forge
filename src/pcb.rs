@@ -14,43 +14,6 @@ const STITCHING_VIA_SIZE: f64 = 0.6; // mm
 const STITCHING_VIA_DRILL: f64 = 0.3; // mm
 const STITCHING_VIA_MARGIN: f64 = 3.0; // mm, margin from board edge
 
-/// Check if a component is a protection device (TVS, ESD, Zener)
-fn is_protection_component(comp: &Component) -> bool {
-    let ref_lower = comp.ref_des.to_lowercase();
-    let val_lower = comp.value.to_lowercase();
-    let desc_lower = comp
-        .description
-        .as_deref()
-        .unwrap_or("")
-        .to_lowercase();
-
-    let is_diode_ref = ref_lower.starts_with('d');
-    let has_protection_keyword = val_lower.contains("tvs")
-        || val_lower.contains("esd")
-        || val_lower.contains("zener")
-        || val_lower.contains("protection")
-        || desc_lower.contains("tvs")
-        || desc_lower.contains("esd")
-        || desc_lower.contains("protection");
-
-    (is_diode_ref && has_protection_keyword) || has_protection_keyword
-}
-
-/// Check if a component is a decoupling/bypass capacitor (100nF)
-fn is_decoupling_cap(comp: &Component) -> bool {
-    let ref_lower = comp.ref_des.to_lowercase();
-    let val_lower = comp.value.to_lowercase().replace(' ', "");
-    let fp_lower = comp.footprint.to_lowercase();
-
-    let is_cap = ref_lower.starts_with('c') || fp_lower.contains("capacitor");
-    let is_100nf = val_lower == "100nf"
-        || val_lower == "0.1uf"
-        || val_lower == "100n"
-        || val_lower == "0.1μf";
-
-    is_cap && is_100nf
-}
-
 /// Check if a component is a connector (expanded detection).
 /// Matches ref_des J*, or footprint containing USB, connector, jack, header, SMA, barrel.
 fn is_connector_component(comp: &Component) -> bool {
@@ -66,28 +29,170 @@ fn is_connector_component(comp: &Component) -> bool {
         || fp_lower.contains("barrel")
 }
 
-/// Check if a component is an IC (multi-pin active device)
-fn is_ic_component(comp: &Component) -> bool {
-    let fp_lower = comp.footprint.to_lowercase();
-    comp.pins.len() > 4
-        && !is_connector_component(comp)
-        && !fp_lower.contains("capacitor")
-        && !fp_lower.contains("resistor")
-        && !fp_lower.contains("inductor")
-        && !fp_lower.contains("led")
-        && !fp_lower.contains("button")
-        && !fp_lower.contains("switch")
-        && !fp_lower.contains("diode")
+/// Check if a component is a small passive-like device (≤2 pins, not a connector).
+/// Includes resistors, capacitors, diodes, LEDs, buttons.
+fn is_passive_like(comp: &Component) -> bool {
+    comp.pins.len() <= 2 && !is_connector_component(comp)
 }
 
-/// Check if a net name is a VCC/power supply net (excluding GND)
-fn is_vcc_net(name: &str) -> bool {
+/// Check if a net name represents a power rail (VCC, GND, VBUS, etc.)
+fn is_power_net_name(name: &str) -> bool {
     let upper = name.to_uppercase();
-    upper.starts_with("VCC")
+    upper == "GND"
+        || upper.starts_with("VCC")
         || upper.starts_with("VDD")
-        || upper.starts_with("V3V3")
         || upper == "3V3"
         || upper == "5V"
+        || upper.starts_with("V3V3")
+        || upper == "VBUS"
+        || upper == "VBAT"
+}
+
+/// Build passive-to-anchor clustering using signal-weighted adjacency.
+/// Signal nets count 10x more than power nets for determining affinity.
+/// Power-only passives (decoupling caps) are distributed evenly among anchors.
+/// Returns a vector where entry[i] = Some(anchor_idx) for passives, None for non-passives.
+fn build_passive_clusters(
+    components: &[Component],
+    adj: &[Vec<usize>],
+    nets: &[crate::schema::Net],
+) -> Vec<Option<usize>> {
+    let n = components.len();
+
+    // Build signal-weighted adjacency: signal nets = 10, power nets = 1
+    let mut weighted_adj = vec![vec![0usize; n]; n];
+    for net in nets {
+        let weight = if is_power_net_name(&net.name) { 1 } else { 10 };
+        let mut comp_indices: Vec<usize> = Vec::new();
+        for pr in &net.pins {
+            if let Some(idx) = components.iter().position(|c| c.name == pr.component) {
+                if !comp_indices.contains(&idx) {
+                    comp_indices.push(idx);
+                }
+            }
+        }
+        for i in 0..comp_indices.len() {
+            for j in (i + 1)..comp_indices.len() {
+                weighted_adj[comp_indices[i]][comp_indices[j]] += weight;
+                weighted_adj[comp_indices[j]][comp_indices[i]] += weight;
+            }
+        }
+    }
+
+    let mut cluster: Vec<Option<usize>> = vec![None; n];
+
+    // First pass: cluster each passive with its most-connected non-passive (signal-weighted)
+    for i in 0..n {
+        if !is_passive_like(&components[i]) {
+            continue;
+        }
+
+        let mut best_anchor: Option<usize> = None;
+        let mut best_score = 0usize;
+        let mut best_pins = 0usize;
+
+        for j in 0..n {
+            if i == j || is_passive_like(&components[j]) {
+                continue; // Only non-passives (ICs, modules, connectors) as anchors
+            }
+
+            let score = weighted_adj[i][j];
+            if score == 0 {
+                continue;
+            }
+
+            let pins = components[j].pins.len();
+            if score > best_score || (score == best_score && pins > best_pins) {
+                best_score = score;
+                best_anchor = Some(j);
+                best_pins = pins;
+            }
+        }
+
+        cluster[i] = best_anchor;
+    }
+
+    // Second pass: redistribute power-only passives for even distribution.
+    // If a passive has only power connections (weighted score ≤ 2, meaning no signal nets)
+    // and its anchor is overloaded, move it to an equally-connected but less-loaded anchor.
+    let mut anchor_counts: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::new();
+    for i in 0..n {
+        if let Some(a) = cluster[i] {
+            *anchor_counts.entry(a).or_insert(0) += 1;
+        }
+    }
+
+    for i in 0..n {
+        if !is_passive_like(&components[i]) {
+            continue;
+        }
+        let current = match cluster[i] {
+            Some(a) => a,
+            None => continue,
+        };
+
+        // Check if this passive has signal connections to its anchor
+        let has_signal = weighted_adj[i][current] > adj[i][current]; // signal weight > just power count
+        if has_signal {
+            continue; // Strong signal binding, don't redistribute
+        }
+
+        // This passive has only power connections — find less-loaded alternatives
+        let current_adj = adj[i][current];
+        let current_count = *anchor_counts.get(&current).unwrap_or(&0);
+
+        let mut best_alt: Option<usize> = None;
+        let mut best_alt_count = current_count;
+
+        for j in 0..n {
+            if i == j || j == current || is_passive_like(&components[j]) {
+                continue;
+            }
+            if is_connector_component(&components[j]) {
+                continue; // Don't redistribute to connectors
+            }
+            if adj[i][j] < current_adj {
+                continue; // Must have at least as many shared nets
+            }
+
+            let alt_count = *anchor_counts.get(&j).unwrap_or(&0);
+            if alt_count + 1 < best_alt_count {
+                best_alt = Some(j);
+                best_alt_count = alt_count;
+            }
+        }
+
+        if let Some(alt) = best_alt {
+            *anchor_counts.get_mut(&current).unwrap() -= 1;
+            *anchor_counts.entry(alt).or_insert(0) += 1;
+            cluster[i] = Some(alt);
+        }
+    }
+
+    // Third pass: unclustered passives inherit anchor from connected clustered passives
+    let snapshot = cluster.clone();
+    for i in 0..n {
+        if cluster[i].is_some() || !is_passive_like(&components[i]) {
+            continue;
+        }
+        let mut best_anchor: Option<usize> = None;
+        let mut best_score = 0usize;
+        for j in 0..n {
+            if i == j || adj[i][j] == 0 {
+                continue;
+            }
+            if let Some(anchor) = snapshot[j] {
+                if adj[i][j] > best_score {
+                    best_score = adj[i][j];
+                    best_anchor = Some(anchor);
+                }
+            }
+        }
+        cluster[i] = best_anchor;
+    }
+
+    cluster
 }
 
 /// Compute component sizes for placement with minimum courtyard clearance.
@@ -314,7 +419,8 @@ fn place_on_edge(
     )
 }
 
-/// Place components using connectivity-aware algorithm with configurable seed/strategy.
+/// Place components using connectivity-aware algorithm with functional clustering.
+/// Passives are grouped with their parent IC/connector and placed adjacent to them.
 fn place_components_with_config(board: &mut Board, config: &PlacementConfig) {
     let margin = 5.0;
     let n = board.components.len();
@@ -346,15 +452,35 @@ fn place_components_with_config(board: &mut Board, config: &PlacementConfig) {
     let sizes = compute_placement_sizes(&board.components);
     let mut positions: Vec<Option<(f64, f64)>> = vec![None; n];
 
-    // 2. Separate connectors from non-connectors
+    // 2. Build functional clusters: each passive maps to its best anchor
+    let passive_cluster = build_passive_clusters(&board.components, &adj, &board.nets);
+    let mut anchor_passives: std::collections::HashMap<usize, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (i, anchor) in passive_cluster.iter().enumerate() {
+        if let Some(a) = anchor {
+            anchor_passives.entry(*a).or_default().push(i);
+        }
+    }
+
+    // Log clusters for debugging
+    for (&anchor_idx, passives) in &anchor_passives {
+        let anchor_name = &board.components[anchor_idx].ref_des;
+        let passive_names: Vec<&str> = passives
+            .iter()
+            .map(|&p| board.components[p].ref_des.as_str())
+            .collect();
+        eprintln!(
+            "  Cluster {}: {:?}",
+            anchor_name, passive_names
+        );
+    }
+
+    // 3. Separate connectors
     let connector_indices: Vec<usize> = (0..n)
         .filter(|&i| is_connector_component(&board.components[i]))
         .collect();
-    let non_connector_indices: Vec<usize> = (0..n)
-        .filter(|&i| !is_connector_component(&board.components[i]))
-        .collect();
 
-    // 3. Place connectors on board edges first
+    // 4. Place connectors on board edges
     for (ci, &comp_idx) in connector_indices.iter().enumerate() {
         let (edge, rotation) = connector_preferred_edge(
             &board.components[comp_idx],
@@ -373,9 +499,34 @@ fn place_components_with_config(board: &mut Board, config: &PlacementConfig) {
         board.components[comp_idx].rotation = rotation;
     }
 
-    // 4. Find most-connected non-connector component → place near center (with offset from config)
-    if non_connector_indices.is_empty() {
-        // Only connectors — apply and return
+    // 5. Place connector-clustered passives near their connectors
+    for &conn_idx in &connector_indices {
+        if let Some(passives) = anchor_passives.get(&conn_idx) {
+            let (cx, cy) = positions[conn_idx].unwrap();
+            for &p in passives {
+                if positions[p].is_some() {
+                    continue;
+                }
+                let (px, py) = find_non_overlapping_with_step(
+                    cx, cy, &sizes, &positions, p,
+                    margin, board.width - margin, margin, board.height - margin,
+                    1.0,
+                );
+                positions[p] = Some((px, py));
+            }
+        }
+    }
+
+    // 6. Identify anchor components (non-connector, >2 pins)
+    let anchor_indices: Vec<usize> = (0..n)
+        .filter(|&i| {
+            !is_connector_component(&board.components[i])
+                && !is_passive_like(&board.components[i])
+        })
+        .collect();
+
+    if anchor_indices.is_empty() {
+        // Only connectors and passives — apply and return
         for (i, comp) in board.components.iter_mut().enumerate() {
             if let Some((x, y)) = positions[i] {
                 comp.x = x;
@@ -387,43 +538,63 @@ fn place_components_with_config(board: &mut Board, config: &PlacementConfig) {
 
     let total_conn: Vec<usize> = (0..n).map(|i| adj[i].iter().sum()).collect();
 
-    // Find the most-connected non-connector component (deterministic)
-    let center_idx = *non_connector_indices.iter()
+    // 7. Place most-connected anchor at center
+    let center_idx = *anchor_indices
+        .iter()
         .max_by_key(|&&i| total_conn[i])
         .unwrap();
 
     let cx = board.width / 2.0 + config.center_angle.cos() * 2.0;
     let cy = board.height / 2.0 + config.center_angle.sin() * 2.0;
-    positions[center_idx] = Some((safe_clamp(cx, margin + 5.0, board.width - margin - 5.0),
-                                   safe_clamp(cy, margin + 5.0, board.height - margin - 5.0)));
+    positions[center_idx] = Some((
+        safe_clamp(cx, margin + 5.0, board.width - margin - 5.0),
+        safe_clamp(cy, margin + 5.0, board.height - margin - 5.0),
+    ));
 
-    // 5. Place remaining non-connector components using pure connectivity-greedy
-    let mut remaining: Vec<usize> = non_connector_indices
+    // Place center anchor's passives immediately
+    if let Some(passives) = anchor_passives.get(&center_idx) {
+        let (acx, acy) = positions[center_idx].unwrap();
+        for &p in passives {
+            if positions[p].is_some() {
+                continue;
+            }
+            let (px, py) = find_non_overlapping_with_step(
+                acx, acy, &sizes, &positions, p,
+                margin, board.width - margin, margin, board.height - margin,
+                1.0,
+            );
+            positions[p] = Some((px, py));
+        }
+    }
+
+    // 8. Place remaining anchors greedily, with their passives after each
+    let mut remaining_anchors: Vec<usize> = anchor_indices
         .iter()
         .copied()
         .filter(|&i| i != center_idx)
         .collect();
 
-    while !remaining.is_empty() {
-        // Score each remaining component by connectivity to placed components (no randomization)
+    while !remaining_anchors.is_empty() {
         let mut best_ri = 0;
         let mut best_score = 0usize;
-        for (ri, &comp_idx) in remaining.iter().enumerate() {
+        for (ri, &comp_idx) in remaining_anchors.iter().enumerate() {
             let mut conn_score = 0usize;
             for placed_idx in 0..n {
                 if positions[placed_idx].is_some() {
                     conn_score += adj[comp_idx][placed_idx];
                 }
             }
-            if conn_score > best_score || (conn_score == best_score && total_conn[comp_idx] > total_conn[remaining[best_ri]]) {
+            if conn_score > best_score
+                || (conn_score == best_score
+                    && total_conn[comp_idx] > total_conn[remaining_anchors[best_ri]])
+            {
                 best_score = conn_score;
                 best_ri = ri;
             }
         }
 
-        let comp_idx = remaining.remove(best_ri);
+        let comp_idx = remaining_anchors.remove(best_ri);
 
-        // Find best placed neighbor
         let mut best_neighbor = center_idx;
         let mut best_conn = 0usize;
         for placed_idx in 0..n {
@@ -441,11 +612,69 @@ fn place_components_with_config(board: &mut Board, config: &PlacementConfig) {
             margin, board.width - margin, margin, board.height - margin,
             step,
         );
+        positions[comp_idx] = Some((px, py));
 
+        // Place this anchor's passives immediately nearby
+        if let Some(passives) = anchor_passives.get(&comp_idx) {
+            for &p in passives {
+                if positions[p].is_some() {
+                    continue;
+                }
+                let (ppx, ppy) = find_non_overlapping_with_step(
+                    px, py, &sizes, &positions, p,
+                    margin, board.width - margin, margin, board.height - margin,
+                    1.0, // tight step for passives near their anchor
+                );
+                positions[p] = Some((ppx, ppy));
+            }
+        }
+    }
+
+    // 9. Place any remaining unclustered components via greedy
+    let mut remaining: Vec<usize> = (0..n).filter(|&i| positions[i].is_none()).collect();
+
+    while !remaining.is_empty() {
+        let mut best_ri = 0;
+        let mut best_score = 0usize;
+        for (ri, &comp_idx) in remaining.iter().enumerate() {
+            let mut conn_score = 0usize;
+            for placed_idx in 0..n {
+                if positions[placed_idx].is_some() {
+                    conn_score += adj[comp_idx][placed_idx];
+                }
+            }
+            if conn_score > best_score
+                || (conn_score == best_score
+                    && total_conn[comp_idx] > total_conn[remaining[best_ri]])
+            {
+                best_score = conn_score;
+                best_ri = ri;
+            }
+        }
+
+        let comp_idx = remaining.remove(best_ri);
+
+        let mut best_neighbor = center_idx;
+        let mut best_conn = 0usize;
+        for placed_idx in 0..n {
+            if positions[placed_idx].is_some() && adj[comp_idx][placed_idx] > best_conn {
+                best_conn = adj[comp_idx][placed_idx];
+                best_neighbor = placed_idx;
+            }
+        }
+
+        let (target_x, target_y) = positions[best_neighbor].unwrap_or((cx, cy));
+        let step = 1.5 * config.spacing_mult;
+
+        let (px, py) = find_non_overlapping_with_step(
+            target_x, target_y, &sizes, &positions, comp_idx,
+            margin, board.width - margin, margin, board.height - margin,
+            step,
+        );
         positions[comp_idx] = Some((px, py));
     }
 
-    // 6. Apply all positions
+    // 10. Apply all positions
     for (i, comp) in board.components.iter_mut().enumerate() {
         if let Some((x, y)) = positions[i] {
             comp.x = x;
@@ -453,18 +682,16 @@ fn place_components_with_config(board: &mut Board, config: &PlacementConfig) {
         }
     }
 
-    // 7. Force-directed relaxation: gently pull connected components closer
-    //    while maintaining routing channels between groups
+    // 11. Force-directed relaxation with centering
     force_directed_relaxation(board, &adj, margin);
 
-    // 8. Simulated annealing: swap/rotate to minimize wire length
+    // 12. Simulated annealing
     simulated_annealing(board, config.seed, margin);
 
-    // 9. Post-placement fixes
-    post_place_protection_near_connectors(board);
-    post_place_decoupling_near_ics(board);
+    // 13. Post-placement: enforce passive proximity to anchors
+    post_place_passives_near_anchors(board);
 
-    // 10. Final overlap validation - detect and fix any remaining overlaps
+    // 14. Final overlap fix
     fix_remaining_overlaps(board);
 }
 
@@ -567,6 +794,22 @@ fn force_directed_relaxation(board: &mut Board, adj: &[Vec<usize>], margin: f64)
                     forces[i].1 += force * dy;
                 }
             }
+        }
+
+        // Centering force: gently push components toward board center for uniform distribution
+        let board_cx = board.width / 2.0;
+        let board_cy = board.height / 2.0;
+        for i in 0..n {
+            if !movable[i] {
+                continue;
+            }
+            let dx = board_cx - board.components[i].x;
+            let dy = board_cy - board.components[i].y;
+            let dist_to_center = (dx * dx + dy * dy).sqrt().max(0.1);
+            // Stronger centering when far from center
+            let center_force = 0.03 * dist_to_center;
+            forces[i].0 += center_force * dx / dist_to_center;
+            forces[i].1 += center_force * dy / dist_to_center;
         }
 
         // Apply forces with clamping, checking for overlaps
@@ -1129,171 +1372,95 @@ fn find_edge_position(
     find_non_overlapping(near_x, near_y, sizes, positions, my_idx, min_x, max_x, min_y, max_y)
 }
 
-/// Post-placement: move protection components (TVS/ESD) adjacent to their connected connectors.
-/// Ensures < 5mm distance and same layer (no via needed).
-fn post_place_protection_near_connectors(board: &mut Board) {
+/// Post-placement: move ALL passive components close to their functional anchor
+/// (the IC, module, or connector they serve). This replaces the separate protection
+/// and decoupling post-placement passes with one comprehensive pass.
+fn post_place_passives_near_anchors(board: &mut Board) {
     let sizes = compute_placement_sizes(&board.components);
     let margin = 5.0;
     let n = board.components.len();
 
-    // Collect moves first to avoid borrow issues
-    let mut moves: Vec<(usize, f64, f64)> = Vec::new();
-
-    for idx in 0..n {
-        if !is_protection_component(&board.components[idx]) {
-            continue;
-        }
-
-        let comp_name = board.components[idx].name.clone();
-        let mut best_connector_pos = None;
-        let mut best_dist = f64::MAX;
-
-        for net in &board.nets {
-            if !net.pins.iter().any(|p| p.component == comp_name) {
-                continue;
-            }
-            for pin_ref in &net.pins {
-                if pin_ref.component == comp_name {
-                    continue;
+    // Rebuild adjacency matrix
+    let mut adj = vec![vec![0usize; n]; n];
+    for net in &board.nets {
+        let mut comp_indices: Vec<usize> = Vec::new();
+        for pr in &net.pins {
+            if let Some(idx) = board.components.iter().position(|c| c.name == pr.component) {
+                if !comp_indices.contains(&idx) {
+                    comp_indices.push(idx);
                 }
-                if let Some(conn) = board.components.iter().find(|c| {
-                    c.name == pin_ref.component && is_connector_component(c)
-                }) {
-                    let dist = (conn.x - board.components[idx].x).powi(2)
-                        + (conn.y - board.components[idx].y).powi(2);
-                    if dist < best_dist {
-                        best_dist = dist;
-                        best_connector_pos = Some((conn.x, conn.y));
+            }
+        }
+        for i in 0..comp_indices.len() {
+            for j in (i + 1)..comp_indices.len() {
+                adj[comp_indices[i]][comp_indices[j]] += 1;
+                adj[comp_indices[j]][comp_indices[i]] += 1;
+            }
+        }
+    }
+
+    let clusters = build_passive_clusters(&board.components, &adj, &board.nets);
+    let max_proximity = 3.0; // mm from anchor boundary
+
+    // Sort passives by distance to anchor (farthest first) so we fix worst cases first
+    let mut passive_moves: Vec<(usize, usize)> = Vec::new();
+    for i in 0..n {
+        if let Some(anchor_idx) = clusters[i] {
+            passive_moves.push((i, anchor_idx));
+        }
+    }
+    passive_moves.sort_by(|a, b| {
+        let dist_a = {
+            let (ax, ay) = (board.components[a.1].x, board.components[a.1].y);
+            let (px, py) = (board.components[a.0].x, board.components[a.0].y);
+            (px - ax).powi(2) + (py - ay).powi(2)
+        };
+        let dist_b = {
+            let (ax, ay) = (board.components[b.1].x, board.components[b.1].y);
+            let (px, py) = (board.components[b.0].x, board.components[b.0].y);
+            (px - ax).powi(2) + (py - ay).powi(2)
+        };
+        dist_b
+            .partial_cmp(&dist_a)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    for (passive_idx, anchor_idx) in passive_moves {
+        let (aw, ah) = sizes[anchor_idx];
+        let ax = board.components[anchor_idx].x;
+        let ay = board.components[anchor_idx].y;
+        let px = board.components[passive_idx].x;
+        let py = board.components[passive_idx].y;
+
+        // Distance from passive center to anchor center
+        let dist = ((px - ax).powi(2) + (py - ay).powi(2)).sqrt();
+        // Approximate anchor boundary radius
+        let anchor_radius = aw.max(ah) / 2.0;
+        let (pw, ph) = sizes[passive_idx];
+        let passive_radius = pw.max(ph) / 2.0;
+
+        if dist > anchor_radius + passive_radius + max_proximity {
+            // Move passive closer to anchor
+            let positions: Vec<Option<(f64, f64)>> = board
+                .components
+                .iter()
+                .enumerate()
+                .map(|(k, c)| {
+                    if k == passive_idx {
+                        None
+                    } else {
+                        Some((c.x, c.y))
                     }
-                }
-            }
+                })
+                .collect();
+
+            let (new_x, new_y) = find_non_overlapping(
+                ax, ay, &sizes, &positions, passive_idx,
+                margin, board.width - margin, margin, board.height - margin,
+            );
+            board.components[passive_idx].x = new_x;
+            board.components[passive_idx].y = new_y;
         }
-
-        if let Some((tx, ty)) = best_connector_pos {
-            moves.push((idx, tx, ty));
-        }
-    }
-
-    for (comp_idx, target_x, target_y) in moves {
-        let positions: Vec<Option<(f64, f64)>> = board
-            .components
-            .iter()
-            .enumerate()
-            .map(|(i, c)| {
-                if i == comp_idx {
-                    None
-                } else {
-                    Some((c.x, c.y))
-                }
-            })
-            .collect();
-
-        let (px, py) = find_non_overlapping(
-            target_x,
-            target_y,
-            &sizes,
-            &positions,
-            comp_idx,
-            margin,
-            board.width - margin,
-            margin,
-            board.height - margin,
-        );
-
-        board.components[comp_idx].x = px;
-        board.components[comp_idx].y = py;
-    }
-}
-
-/// Post-placement: move decoupling capacitors (100nF) adjacent to their connected ICs.
-/// Assigns each cap to the closest IC sharing a VCC net, places within 5mm.
-fn post_place_decoupling_near_ics(board: &mut Board) {
-    let sizes = compute_placement_sizes(&board.components);
-    let margin = 5.0;
-    let n = board.components.len();
-
-    let cap_indices: Vec<usize> = (0..n)
-        .filter(|&i| is_decoupling_cap(&board.components[i]))
-        .collect();
-
-    let mut assigned_ics: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    let mut moves: Vec<(usize, f64, f64)> = Vec::new();
-
-    for &cap_idx in &cap_indices {
-        let cap_name = board.components[cap_idx].name.clone();
-
-        // Find ICs sharing a VCC net with this cap
-        let mut candidate_ics: Vec<usize> = Vec::new();
-        for net in &board.nets {
-            if !is_vcc_net(&net.name) {
-                continue;
-            }
-            if !net.pins.iter().any(|p| p.component == cap_name) {
-                continue;
-            }
-            for pin_ref in &net.pins {
-                if pin_ref.component == cap_name {
-                    continue;
-                }
-                if let Some(ic_idx) = board.components.iter().position(|c| {
-                    c.name == pin_ref.component && is_ic_component(c)
-                }) {
-                    if !candidate_ics.contains(&ic_idx) && !assigned_ics.contains(&ic_idx) {
-                        candidate_ics.push(ic_idx);
-                    }
-                }
-            }
-        }
-
-        // Find closest unassigned IC
-        let mut best_ic = None;
-        let mut best_dist = f64::MAX;
-        for &ic_idx in &candidate_ics {
-            let ic = &board.components[ic_idx];
-            let cap = &board.components[cap_idx];
-            let dist = (ic.x - cap.x).powi(2) + (ic.y - cap.y).powi(2);
-            if dist < best_dist {
-                best_dist = dist;
-                best_ic = Some(ic_idx);
-            }
-        }
-
-        if let Some(ic_idx) = best_ic {
-            assigned_ics.insert(ic_idx);
-            let target_x = board.components[ic_idx].x;
-            let target_y = board.components[ic_idx].y;
-            moves.push((cap_idx, target_x, target_y));
-        }
-    }
-
-    for (comp_idx, target_x, target_y) in moves {
-        let positions: Vec<Option<(f64, f64)>> = board
-            .components
-            .iter()
-            .enumerate()
-            .map(|(i, c)| {
-                if i == comp_idx {
-                    None
-                } else {
-                    Some((c.x, c.y))
-                }
-            })
-            .collect();
-
-        let (px, py) = find_non_overlapping(
-            target_x,
-            target_y,
-            &sizes,
-            &positions,
-            comp_idx,
-            margin,
-            board.width - margin,
-            margin,
-            board.height - margin,
-        );
-
-        board.components[comp_idx].x = px;
-        board.components[comp_idx].y = py;
     }
 }
 
