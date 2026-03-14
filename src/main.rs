@@ -82,7 +82,7 @@ fn build(input: &PathBuf, output: &PathBuf, use_topola: bool, open_viewer: bool)
     println!("Building from: {}", input.display());
 
     // Step 1: Parse
-    println!("[1/8] Parsing circuit definition...");
+    println!("[1/9] Parsing circuit definition...");
     let mut board = parser::parse_circuit(input).context("Failed to parse circuit")?;
     println!(
         "  → {} components, {} nets",
@@ -94,23 +94,23 @@ fn build(input: &PathBuf, output: &PathBuf, use_topola: bool, open_viewer: bool)
     std::fs::create_dir_all(output)?;
 
     // Step 3: Generate schematic
-    println!("[2/8] Generating schematic...");
+    println!("[2/9] Generating schematic...");
     let sch_path = output.join("pcb-forge.kicad_sch");
     schematic::generate_schematic(&board, &sch_path)?;
     println!("  → {}", sch_path.display());
 
     // Step 4: Generate PCB with placement
-    println!("[3/8] Generating PCB layout...");
+    println!("[3/9] Generating PCB layout...");
     let pcb_path = output.join("pcb-forge.kicad_pcb");
     pcb::generate_pcb(&mut board, &pcb_path)?;
     println!("  → {}", pcb_path.display());
 
     // Step 5: Route traces
     let routed_nets = if use_topola {
-        println!("[4/8] Routing traces (Topola topological router)...");
+        println!("[4/9] Routing traces (Topola topological router)...");
         topola_router::route_with_topola(&board)?
     } else {
-        println!("[4/8] Routing traces (A* router)...");
+        println!("[4/9] Routing traces (A* router)...");
         let mut router = Router::new(board.width, board.height, 0.1);
         router.route_all(&board)
     };
@@ -123,26 +123,31 @@ fn build(input: &PathBuf, output: &PathBuf, use_topola: bool, open_viewer: bool)
     println!("  → Traces written to {}", pcb_path.display());
 
     // Step 6: Generate Gerbers
-    println!("[5/8] Generating Gerber files...");
+    println!("[5/9] Generating Gerber files...");
     let gerber_dir = output.join("gerbers");
     gerber::generate_gerbers(&board, &routed_nets, &gerber_dir)?;
     println!("  → {}", gerber_dir.display());
 
     // Step 7: Generate BOM
-    println!("[6/8] Generating BOM and pick-and-place...");
+    println!("[6/9] Generating BOM and pick-and-place...");
     bom::generate_bom(&board, output)?;
     println!("  → BOM.csv, PickAndPlace.csv");
 
     // Step 8: Create JLCPCB ZIP
-    println!("[7/8] Creating JLCPCB ZIP...");
+    println!("[7/9] Creating JLCPCB ZIP...");
     let zip_path = output.join("jlcpcb.zip");
     create_jlcpcb_zip(&gerber_dir, output, &zip_path)?;
     println!("  → {}", zip_path.display());
 
     // Step 9: Generate viewer
-    println!("[8/8] Generating 2D viewer...");
+    println!("[8/9] Generating 2D viewer...");
     let viewer_path = output.join("viewer.html");
     viewer::generate_viewer(&board, &routed_nets, &viewer_path)?;
+
+    // Step 10: Generate PNG preview
+    println!("[9/9] Generating PNG preview...");
+    let png_path = output.join("pcb-preview.png");
+    viewer::generate_png(&board, &routed_nets, &png_path)?;
 
     if open_viewer {
         viewer::open_viewer(&viewer_path);

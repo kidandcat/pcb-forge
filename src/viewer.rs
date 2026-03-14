@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::Path;
 
 use crate::router::RoutedNet;
@@ -542,4 +542,110 @@ fn rotate_size(w: f64, h: f64, degrees: f64) -> (f64, f64) {
     } else {
         (w, h)
     }
+}
+
+/// Generate a PNG preview image of the PCB.
+pub fn generate_png(board: &Board, routed_nets: &[RoutedNet], output_path: &Path) -> Result<()> {
+    let svg_str = render_standalone_svg(board, routed_nets);
+
+    let options = resvg::usvg::Options::default();
+    let tree = resvg::usvg::Tree::from_str(&svg_str, &options)
+        .context("Failed to parse SVG for PNG rendering")?;
+
+    let svg_size = tree.size();
+
+    // Calculate pixel dimensions: at least 1920px wide, proportional height
+    let min_width = 1920u32;
+    let scale = (min_width as f32) / svg_size.width();
+    let px_w = min_width;
+    let px_h = (svg_size.height() * scale).ceil() as u32;
+
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(px_w, px_h)
+        .context("Failed to create pixmap")?;
+
+    let transform = resvg::tiny_skia::Transform::from_scale(scale, scale);
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+
+    pixmap
+        .save_png(output_path)
+        .context("Failed to save PNG")?;
+
+    println!("  → {}", output_path.display());
+    Ok(())
+}
+
+/// Render a standalone SVG document (no HTML/JS) suitable for rasterization.
+fn render_standalone_svg(board: &Board, routed_nets: &[RoutedNet]) -> String {
+    let mut svg_elements = String::new();
+
+    let margin = 5.0;
+    let vb_x = -margin;
+    let vb_y = -margin;
+    let vb_w = board.width + margin * 2.0;
+    let vb_h = board.height + margin * 2.0;
+
+    // Zones
+    svg_elements.push_str("  <g>\n");
+    render_zones(board, &mut svg_elements);
+    svg_elements.push_str("  </g>\n");
+
+    // B.Cu traces
+    svg_elements.push_str("  <g>\n");
+    render_traces(routed_nets, 1, "#4444ff", &mut svg_elements);
+    svg_elements.push_str("  </g>\n");
+
+    // F.Cu traces
+    svg_elements.push_str("  <g>\n");
+    render_traces(routed_nets, 0, "#ff3333", &mut svg_elements);
+    svg_elements.push_str("  </g>\n");
+
+    // Vias
+    svg_elements.push_str("  <g>\n");
+    render_vias(routed_nets, &mut svg_elements);
+    svg_elements.push_str("  </g>\n");
+
+    // Courtyards
+    svg_elements.push_str("  <g>\n");
+    render_courtyards(board, &mut svg_elements);
+    svg_elements.push_str("  </g>\n");
+
+    // Pads
+    svg_elements.push_str("  <g>\n");
+    render_pads(board, &mut svg_elements);
+    svg_elements.push_str("  </g>\n");
+
+    // Silkscreen
+    svg_elements.push_str("  <g>\n");
+    render_silkscreen(board, &mut svg_elements);
+    svg_elements.push_str("  </g>\n");
+
+    // Board outline
+    svg_elements.push_str(&format!(
+        "  <rect x=\"0\" y=\"0\" width=\"{}\" height=\"{}\" fill=\"none\" stroke=\"#cccc00\" stroke-width=\"0.15\" />\n",
+        board.width, board.height
+    ));
+
+    // Scale bar
+    let scale_bar = render_scale_bar(board);
+
+    format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="{vb_x} {vb_y} {vb_w} {vb_h}" width="{vb_w}" height="{vb_h}">
+  <!-- Background -->
+  <rect x="{vb_x}" y="{vb_y}" width="{vb_w}" height="{vb_h}" fill="#0d3320"/>
+  <!-- PCB body -->
+  <rect x="0" y="0" width="{bw}" height="{bh}" fill="#1a5c36" rx="0.5" ry="0.5"/>
+  <!-- Scale bar -->
+  {scale_bar}
+  <!-- Layers -->
+{svg_elements}
+</svg>"##,
+        vb_x = vb_x,
+        vb_y = vb_y,
+        vb_w = vb_w,
+        vb_h = vb_h,
+        bw = board.width,
+        bh = board.height,
+        scale_bar = scale_bar,
+        svg_elements = svg_elements,
+    )
 }

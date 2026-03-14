@@ -15,4 +15,5 @@ chrono = "0.4"
 csv = "1"
 zip = "2"
 anyhow = "1"
+resvg = "0.44"
 topola = { path = "../topola" }
