@@ -123,12 +123,23 @@ pub fn generate_pcb(board: &mut Board, output: &Path) -> Result<()> {
 
 /// Place components using connectivity-aware algorithm.
 /// Groups connected components together, puts most-connected component at center.
+/// Components with manually_placed == true keep their TOML-specified positions.
 fn place_components(board: &mut Board) {
     let margin = 5.0;
     let n = board.components.len();
     if n == 0 {
         return;
     }
+
+    // If all components are manually placed, just auto-size the board if needed
+    let all_manual = board.components.iter().all(|c| c.manually_placed);
+    if all_manual {
+        auto_size_board_if_needed(board, margin);
+        return;
+    }
+
+    // Auto-size board if dimensions were not specified (width/height == 0)
+    auto_size_board_if_needed(board, margin);
 
     // 1. Build connectivity adjacency matrix (weight = shared nets)
     let mut adj = vec![vec![0usize; n]; n];
@@ -152,22 +163,39 @@ fn place_components(board: &mut Board) {
     // 2. Get component sizes for placement (with courtyard clearance)
     let sizes = compute_placement_sizes(&board.components);
 
-    // 3. Find most connected component → place at center
+    // 3. Initialize positions: manually placed components are pre-set
+    let mut positions: Vec<Option<(f64, f64)>> = vec![None; n];
+    for (i, comp) in board.components.iter().enumerate() {
+        if comp.manually_placed {
+            positions[i] = Some((comp.x, comp.y));
+        }
+    }
+
+    // 4. Find most connected auto-placed component → place at center
+    let auto_indices: Vec<usize> = (0..n)
+        .filter(|&i| !board.components[i].manually_placed)
+        .collect();
+
+    if auto_indices.is_empty() {
+        return;
+    }
+
     let total_conn: Vec<usize> = (0..n).map(|i| adj[i].iter().sum()).collect();
-    let center_idx = total_conn
+    let center_idx = auto_indices
         .iter()
-        .enumerate()
-        .max_by_key(|(_, &v)| v)
-        .map(|(i, _)| i)
-        .unwrap_or(0);
+        .max_by_key(|&&i| total_conn[i])
+        .copied()
+        .unwrap_or(auto_indices[0]);
 
     let cx = board.width / 2.0;
     let cy = board.height / 2.0;
-    let mut positions: Vec<Option<(f64, f64)>> = vec![None; n];
     positions[center_idx] = Some((cx, cy));
 
-    // 4. Place remaining components near their most-connected placed neighbor
-    let mut remaining: Vec<usize> = (0..n).filter(|&i| i != center_idx).collect();
+    // 5. Place remaining auto components near their most-connected placed neighbor
+    let mut remaining: Vec<usize> = auto_indices
+        .into_iter()
+        .filter(|&i| i != center_idx)
+        .collect();
 
     while !remaining.is_empty() {
         let mut best_ri = 0;
@@ -211,19 +239,67 @@ fn place_components(board: &mut Board) {
         positions[comp_idx] = Some((px, py));
     }
 
-    // 5. Apply positions and report
+    // 6. Apply positions (only for auto-placed components)
     for (i, comp) in board.components.iter_mut().enumerate() {
-        if let Some((x, y)) = positions[i] {
-            comp.x = x;
-            comp.y = y;
+        if !comp.manually_placed {
+            if let Some((x, y)) = positions[i] {
+                comp.x = x;
+                comp.y = y;
+            }
         }
     }
 
-    // 6. Post-placement: move protection components near their connected connectors
+    // 7. Post-placement: move protection components near their connected connectors
+    //    (only affects non-manually-placed components)
     post_place_protection_near_connectors(board);
 
-    // 7. Post-placement: move decoupling capacitors near their connected ICs
+    // 8. Post-placement: move decoupling capacitors near their connected ICs
     post_place_decoupling_near_ics(board);
+}
+
+/// Auto-calculate board dimensions if not specified (width or height == 0).
+/// Computes bounding box from all component sizes and positions.
+fn auto_size_board_if_needed(board: &mut Board, margin: f64) {
+    if board.width > 0.0 && board.height > 0.0 {
+        return;
+    }
+
+    let sizes = compute_placement_sizes(&board.components);
+    let manual_count = board.components.iter().filter(|c| c.manually_placed).count();
+
+    if manual_count > 0 {
+        // Compute bounding box from manually placed components
+        let mut max_x: f64 = 0.0;
+        let mut max_y: f64 = 0.0;
+        for (i, comp) in board.components.iter().enumerate() {
+            if comp.manually_placed {
+                let (sw, sh) = sizes[i];
+                let right = comp.x + sw / 2.0;
+                let bottom = comp.y + sh / 2.0;
+                max_x = max_x.max(right);
+                max_y = max_y.max(bottom);
+            }
+        }
+        // Add margin for auto-placed components and board edge
+        let auto_count = board.components.len() - manual_count;
+        let extra = if auto_count > 0 { 20.0 } else { 0.0 };
+        if board.width <= 0.0 {
+            board.width = max_x + margin + extra;
+        }
+        if board.height <= 0.0 {
+            board.height = max_y + margin + extra;
+        }
+    } else {
+        // No manual components: estimate from total component area
+        let total_area: f64 = sizes.iter().map(|(w, h)| w * h).sum();
+        let side = (total_area * 3.0).sqrt().max(30.0);
+        if board.width <= 0.0 {
+            board.width = side;
+        }
+        if board.height <= 0.0 {
+            board.height = side * 0.75;
+        }
+    }
 }
 
 /// Find a non-overlapping position near (tx, ty) using spiral search.
@@ -354,6 +430,9 @@ fn post_place_protection_near_connectors(board: &mut Board) {
     let mut moves: Vec<(usize, f64, f64)> = Vec::new();
 
     for idx in 0..n {
+        if board.components[idx].manually_placed {
+            continue;
+        }
         if !is_protection_component(&board.components[idx]) {
             continue;
         }
@@ -434,6 +513,9 @@ fn post_place_decoupling_near_ics(board: &mut Board) {
     let mut moves: Vec<(usize, f64, f64)> = Vec::new();
 
     for &cap_idx in &cap_indices {
+        if board.components[cap_idx].manually_placed {
+            continue;
+        }
         let cap_name = board.components[cap_idx].name.clone();
 
         // Find ICs sharing a VCC net with this cap
@@ -713,7 +795,11 @@ fn write_footprint(buf: &mut String, comp: &Component, board: &Board) {
     buf.push_str(&format!("  (footprint \"{}\"\n", comp.footprint));
     buf.push_str("    (layer \"F.Cu\")\n");
     buf.push_str(&format!("    (uuid \"{}\")\n", fp_uuid));
-    buf.push_str(&format!("    (at {} {})\n", comp.x, comp.y));
+    if comp.rotation != 0.0 {
+        buf.push_str(&format!("    (at {} {} {})\n", comp.x, comp.y, comp.rotation));
+    } else {
+        buf.push_str(&format!("    (at {} {})\n", comp.x, comp.y));
+    }
 
     // Properties
     buf.push_str(&format!(

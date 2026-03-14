@@ -16,8 +16,10 @@ pub struct CircuitDefinition {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct BoardDef {
-    pub width: f64,
-    pub height: f64,
+    #[serde(default)]
+    pub width: Option<f64>,
+    #[serde(default)]
+    pub height: Option<f64>,
     #[serde(default = "default_layers")]
     pub layers: u32,
     #[serde(default = "default_trace_width")]
@@ -48,6 +50,12 @@ pub struct ComponentDef {
     pub pins: HashMap<String, PinDef>,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
+    pub x: Option<f64>,
+    #[serde(default)]
+    pub y: Option<f64>,
+    #[serde(default)]
+    pub rotation: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -126,6 +134,7 @@ pub struct Component {
     pub x: f64,
     pub y: f64,
     pub rotation: f64,
+    pub manually_placed: bool,
 }
 
 #[derive(Debug, Clone)]

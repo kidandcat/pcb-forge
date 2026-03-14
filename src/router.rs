@@ -1059,6 +1059,7 @@ mod tests {
                     x: 5.0,
                     y: 10.0,
                     rotation: 0.0,
+                    manually_placed: false,
                 },
                 Component {
                     ref_des: "R2".to_string(),
@@ -1082,6 +1083,7 @@ mod tests {
                     x: 15.0,
                     y: 10.0,
                     rotation: 0.0,
+                    manually_placed: false,
                 },
             ],
             nets: vec![Net {
@@ -1180,6 +1182,7 @@ mod tests {
                     x: 3.0,
                     y: 10.0,
                     rotation: 0.0,
+                    manually_placed: false,
                 },
                 Component {
                     ref_des: "R2".to_string(),
@@ -1203,6 +1206,7 @@ mod tests {
                     x: 17.0,
                     y: 10.0,
                     rotation: 0.0,
+                    manually_placed: false,
                 },
                 Component {
                     ref_des: "R3".to_string(),
@@ -1226,6 +1230,7 @@ mod tests {
                     x: 3.0,
                     y: 10.75,
                     rotation: 0.0,
+                    manually_placed: false,
                 },
                 Component {
                     ref_des: "R4".to_string(),
@@ -1249,6 +1254,7 @@ mod tests {
                     x: 17.0,
                     y: 10.75,
                     rotation: 0.0,
+                    manually_placed: false,
                 },
             ],
             nets: vec![
