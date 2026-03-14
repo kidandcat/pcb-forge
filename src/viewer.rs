@@ -486,24 +486,14 @@ fn render_silkscreen(board: &Board, out: &mut String) {
             let (min_x, min_y, max_x, max_y) = fp.courtyard_bounds();
             let comp_w = max_x - min_x;
             let comp_h = max_y - min_y;
-            (comp_w.min(comp_h) * 0.45).clamp(1.2, 4.0)
+            (comp_w.min(comp_h) * 0.25).clamp(0.6, 2.0)
         } else {
-            1.5
+            0.8
         };
-
-        // Dark background for readability
-        let text_w = comp.ref_des.len() as f64 * font_size * 0.65;
-        let text_h = font_size * 1.3;
-        out.push_str(&format!(
-            "    <rect x=\"{:.3}\" y=\"{:.3}\" width=\"{:.3}\" height=\"{:.3}\" rx=\"{:.2}\" fill=\"rgba(0,0,0,0.75)\" />\n",
-            comp.x - text_w / 2.0, comp.y - text_h / 2.0,
-            text_w, text_h,
-            font_size * 0.15,
-        ));
 
         // Offset y by ~0.35 * font_size for visual vertical centering (resvg compatible)
         out.push_str(&format!(
-            "    <text x=\"{:.3}\" y=\"{:.3}\" fill=\"#ffdd00\" font-size=\"{:.2}\" font-family=\"sans-serif\" text-anchor=\"middle\" font-weight=\"bold\" data-info=\"{} ({})\">{}</text>\n",
+            "    <text x=\"{:.3}\" y=\"{:.3}\" fill=\"#ffdd00\" font-size=\"{:.2}\" font-family=\"sans-serif\" text-anchor=\"middle\" data-info=\"{} ({})\">{}</text>\n",
             comp.x, comp.y + font_size * 0.35,
             font_size,
             comp.ref_des, comp.value,
