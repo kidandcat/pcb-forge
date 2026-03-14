@@ -453,12 +453,346 @@ fn place_components_with_config(board: &mut Board, config: &PlacementConfig) {
         }
     }
 
-    // 7. Post-placement fixes
+    // 7. Force-directed relaxation: gently pull connected components closer
+    //    while maintaining routing channels between groups
+    force_directed_relaxation(board, &adj, margin);
+
+    // 8. Simulated annealing: swap/rotate to minimize wire length
+    simulated_annealing(board, config.seed, margin);
+
+    // 9. Post-placement fixes
     post_place_protection_near_connectors(board);
     post_place_decoupling_near_ics(board);
 
-    // 8. Final overlap validation - detect and fix any remaining overlaps
+    // 10. Final overlap validation - detect and fix any remaining overlaps
     fix_remaining_overlaps(board);
+}
+
+/// Compute total wire length (sum of Manhattan distances between connected pads).
+fn compute_wire_length(board: &Board) -> f64 {
+    let mut total = 0.0;
+    for net in &board.nets {
+        let positions: Vec<(f64, f64)> = net
+            .pins
+            .iter()
+            .filter_map(|pr| {
+                let comp = board.components.iter().find(|c| c.name == pr.component)?;
+                let pin = comp.pins.iter().find(|p| p.name == pr.pin)?;
+                let (rx, ry) = rotate_point(pin.x, pin.y, comp.rotation);
+                Some((comp.x + rx, comp.y + ry))
+            })
+            .collect();
+        // MST-like: sum nearest-neighbor chain distances
+        if positions.len() < 2 {
+            continue;
+        }
+        let mut remaining: Vec<usize> = (1..positions.len()).collect();
+        let mut current = 0;
+        while !remaining.is_empty() {
+            let (best_ri, best_dist) = remaining
+                .iter()
+                .enumerate()
+                .map(|(ri, &idx)| {
+                    let d = (positions[current].0 - positions[idx].0).abs()
+                        + (positions[current].1 - positions[idx].1).abs();
+                    (ri, d)
+                })
+                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                .unwrap();
+            total += best_dist;
+            current = remaining.remove(best_ri);
+        }
+    }
+    total
+}
+
+/// Rotate a point (x, y) by angle degrees around origin.
+fn rotate_point(x: f64, y: f64, angle_deg: f64) -> (f64, f64) {
+    if angle_deg == 0.0 {
+        return (x, y);
+    }
+    let rad = angle_deg.to_radians();
+    let cos_a = rad.cos();
+    let sin_a = rad.sin();
+    (x * cos_a - y * sin_a, x * sin_a + y * cos_a)
+}
+
+/// Force-directed relaxation: gently pull strongly-connected components closer
+/// while maintaining routing channels. Only attracts; relies on overlap fixing
+/// for repulsion.
+fn force_directed_relaxation(board: &mut Board, adj: &[Vec<usize>], margin: f64) {
+    let n = board.components.len();
+    if n < 2 {
+        return;
+    }
+
+    let sizes = compute_placement_sizes(&board.components);
+    let iterations = 40;
+    let max_step: f64 = 0.5; // mm max displacement per iteration (conservative)
+
+    // Don't move connectors (they're placed on edges intentionally)
+    let movable: Vec<bool> = board
+        .components
+        .iter()
+        .map(|c| !is_connector_component(c))
+        .collect();
+
+    for _ in 0..iterations {
+        let mut forces: Vec<(f64, f64)> = vec![(0.0, 0.0); n];
+
+        for i in 0..n {
+            if !movable[i] {
+                continue;
+            }
+
+            for j in 0..n {
+                if i == j {
+                    continue;
+                }
+                let connectivity = adj[i][j];
+                if connectivity == 0 {
+                    continue; // Only attract connected components
+                }
+
+                let dx = board.components[j].x - board.components[i].x;
+                let dy = board.components[j].y - board.components[i].y;
+                let dist = (dx * dx + dy * dy).sqrt().max(0.1);
+
+                // Only attract if components are far apart relative to their sizes
+                let ideal_dist = (sizes[i].0 + sizes[j].0) / 2.0 + 2.0; // leave 2mm routing channel
+                if dist > ideal_dist * 1.5 {
+                    // Gentle attraction proportional to connectivity and excess distance
+                    let force = 0.15 * connectivity as f64 * (dist - ideal_dist) / dist;
+                    forces[i].0 += force * dx;
+                    forces[i].1 += force * dy;
+                }
+            }
+        }
+
+        // Apply forces with clamping, checking for overlaps
+        for i in 0..n {
+            if !movable[i] {
+                continue;
+            }
+            let (fx, fy) = forces[i];
+            let mag = (fx * fx + fy * fy).sqrt();
+            if mag < 0.01 {
+                continue;
+            }
+            let scale = max_step.min(mag) / mag;
+            let new_x = board.components[i].x + fx * scale;
+            let new_y = board.components[i].y + fy * scale;
+
+            let (hw, hh) = (sizes[i].0 / 2.0, sizes[i].1 / 2.0);
+            let clamped_x = safe_clamp(new_x, margin + hw, board.width - margin - hw);
+            let clamped_y = safe_clamp(new_y, margin + hh, board.height - margin - hh);
+
+            // Only apply if it doesn't create overlaps
+            let old_x = board.components[i].x;
+            let old_y = board.components[i].y;
+            board.components[i].x = clamped_x;
+            board.components[i].y = clamped_y;
+
+            if check_component_overlaps(&board.components, &sizes, i, 0.0) {
+                board.components[i].x = old_x;
+                board.components[i].y = old_y;
+            }
+        }
+    }
+}
+
+/// Get effective placement size accounting for rotation.
+fn effective_size(base_size: (f64, f64), rotation: f64) -> (f64, f64) {
+    let rot = rotation % 180.0;
+    if (rot - 90.0).abs() < 1.0 {
+        (base_size.1, base_size.0) // swapped for 90° or 270°
+    } else {
+        base_size
+    }
+}
+
+/// Check if a specific component overlaps with any other, using current rotation for sizing.
+/// Uses a small tolerance to allow near-touching (the final overlap fix pass handles cleanup).
+fn check_component_overlaps(
+    components: &[Component],
+    base_sizes: &[(f64, f64)],
+    check_idx: usize,
+    tolerance: f64,
+) -> bool {
+    let (wi, hi) = effective_size(base_sizes[check_idx], components[check_idx].rotation);
+    for j in 0..components.len() {
+        if j == check_idx {
+            continue;
+        }
+        let (wj, hj) = effective_size(base_sizes[j], components[j].rotation);
+        let dx = (components[check_idx].x - components[j].x).abs();
+        let dy = (components[check_idx].y - components[j].y).abs();
+        if dx < (wi + wj) / 2.0 - tolerance && dy < (hi + hj) / 2.0 - tolerance {
+            return true;
+        }
+    }
+    false
+}
+
+/// Simulated annealing: try random swaps, rotations, and nudges.
+/// Accepts worse solutions with decreasing probability to escape local minima.
+fn simulated_annealing(board: &mut Board, seed: u64, margin: f64) {
+    let n = board.components.len();
+    if n < 3 {
+        return;
+    }
+
+    let base_sizes = compute_placement_sizes(&board.components);
+
+    // Don't move connectors
+    let movable_indices: Vec<usize> = (0..n)
+        .filter(|&i| !is_connector_component(&board.components[i]))
+        .collect();
+
+    if movable_indices.len() < 2 {
+        return;
+    }
+
+    let initial_wl = compute_wire_length(board);
+    let mut best_wl = initial_wl;
+    let mut current_wl = best_wl;
+    let mut best_positions: Vec<(f64, f64, f64)> = board
+        .components
+        .iter()
+        .map(|c| (c.x, c.y, c.rotation))
+        .collect();
+
+    let mut rng_state = seed ^ 0xDEADBEEF;
+    let lcg_next = |state: &mut u64| -> u64 {
+        *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *state >> 16
+    };
+
+    let initial_temp = best_wl * 0.25;
+    let cooling = 0.999;
+    let iterations = 5000;
+    let mut temp = initial_temp;
+    let mut accepted = 0u32;
+
+    for _ in 0..iterations {
+        let r = lcg_next(&mut rng_state);
+        let move_type = r % 10; // 0-3: swap, 4-5: rotate, 6-9: nudge
+
+        // Save state of affected components
+        let saved: Vec<(f64, f64, f64)> = board
+            .components
+            .iter()
+            .map(|c| (c.x, c.y, c.rotation))
+            .collect();
+
+        match move_type {
+            0..=3 => {
+                // Swap two non-connector components
+                let ai = lcg_next(&mut rng_state) as usize % movable_indices.len();
+                let bi = lcg_next(&mut rng_state) as usize % movable_indices.len();
+                if ai == bi {
+                    continue;
+                }
+                let a = movable_indices[ai];
+                let b = movable_indices[bi];
+                let (ax, ay) = (board.components[a].x, board.components[a].y);
+                board.components[a].x = board.components[b].x;
+                board.components[a].y = board.components[b].y;
+                board.components[b].x = ax;
+                board.components[b].y = ay;
+            }
+            4..=5 => {
+                // Rotate a component by 90°
+                let a = movable_indices[lcg_next(&mut rng_state) as usize % movable_indices.len()];
+                board.components[a].rotation = (board.components[a].rotation + 90.0) % 360.0;
+            }
+            _ => {
+                // Nudge a component
+                let a = movable_indices[lcg_next(&mut rng_state) as usize % movable_indices.len()];
+                let scale = 5.0 * (temp / initial_temp).max(0.05);
+                let dx = ((lcg_next(&mut rng_state) % 200) as f64 - 100.0) * 0.01 * scale;
+                let dy = ((lcg_next(&mut rng_state) % 200) as f64 - 100.0) * 0.01 * scale;
+                let (ew, eh) = effective_size(base_sizes[a], board.components[a].rotation);
+                board.components[a].x = safe_clamp(
+                    board.components[a].x + dx,
+                    margin + ew / 2.0,
+                    board.width - margin - ew / 2.0,
+                );
+                board.components[a].y = safe_clamp(
+                    board.components[a].y + dy,
+                    margin + eh / 2.0,
+                    board.height - margin - eh / 2.0,
+                );
+            }
+        }
+
+        // Check for overlaps only on moved components (with small tolerance)
+        let tolerance = 0.3; // mm tolerance for near-touching
+        let changed: Vec<usize> = (0..n)
+            .filter(|&i| {
+                (board.components[i].x - saved[i].0).abs() > 0.01
+                    || (board.components[i].y - saved[i].1).abs() > 0.01
+                    || (board.components[i].rotation - saved[i].2).abs() > 0.01
+            })
+            .collect();
+        let moved_overlap = changed.iter().any(|&idx| {
+            check_component_overlaps(&board.components, &base_sizes, idx, tolerance)
+        });
+
+        if moved_overlap {
+            for (i, c) in board.components.iter_mut().enumerate() {
+                c.x = saved[i].0;
+                c.y = saved[i].1;
+                c.rotation = saved[i].2;
+            }
+            continue;
+        }
+
+        let new_wl = compute_wire_length(board);
+        let delta = new_wl - current_wl;
+
+        // Metropolis criterion
+        let accept = if delta <= 0.0 {
+            true
+        } else {
+            let p = (-delta / temp.max(0.01)).exp();
+            let r = (lcg_next(&mut rng_state) % 10000) as f64 / 10000.0;
+            r < p
+        };
+
+        if accept {
+            accepted += 1;
+            current_wl = new_wl;
+            if current_wl < best_wl {
+                best_wl = current_wl;
+                best_positions = board
+                    .components
+                    .iter()
+                    .map(|c| (c.x, c.y, c.rotation))
+                    .collect();
+            }
+        } else {
+            for (i, c) in board.components.iter_mut().enumerate() {
+                c.x = saved[i].0;
+                c.y = saved[i].1;
+                c.rotation = saved[i].2;
+            }
+        }
+
+        temp *= cooling;
+    }
+
+    // Restore best found positions
+    for (i, c) in board.components.iter_mut().enumerate() {
+        c.x = best_positions[i].0;
+        c.y = best_positions[i].1;
+        c.rotation = best_positions[i].2;
+    }
+
+    eprintln!(
+        "  SA optimization: wire length {:.1}mm → {:.1}mm ({} moves accepted)",
+        initial_wl, best_wl, accepted
+    );
 }
 
 /// Final pass: detect any remaining overlaps and fix them by moving offending components.
