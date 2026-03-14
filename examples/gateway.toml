@@ -2,7 +2,7 @@
 # ESP32-S3 + LoRa + LTE Gateway
 
 [board]
-aspect_ratio = 1.3  # landscape (width/height ratio), 1.0 = square
+aspect_ratio = 3.0  # landscape (width/height ratio), 1.0 = square
 layers = 2
 trace_width = 0.25  # mm
 clearance = 0.2     # mm
@@ -12,6 +12,7 @@ clearance = 0.2     # mm
 # ──────────────────────────────────────
 # Adjust these after reviewing placement results to optimize the design.
 [options]
+aspect_ratio = 3.0        # Override board aspect ratio (very elongated)
 density = 2.0             # Courtyard area multiplier for board sizing (1.5=tight, 2.5=spacious)
 spacing = 1.0             # Base component spacing multiplier (0.5=tight, 2.0=spread)
 placement_variants = 10   # Number of placement variants to generate (1-50)

@@ -422,8 +422,8 @@ fn place_components_with_config(board: &mut Board, config: &PlacementConfig) {
 
     let cx = board.width / 2.0 + config.center_angle.cos() * 3.0 * config.spacing_mult;
     let cy = board.height / 2.0 + config.center_angle.sin() * 3.0 * config.spacing_mult;
-    positions[center_idx] = Some((cx.clamp(margin + 5.0, board.width - margin - 5.0),
-                                   cy.clamp(margin + 5.0, board.height - margin - 5.0)));
+    positions[center_idx] = Some((safe_clamp(cx, margin + 5.0, board.width - margin - 5.0),
+                                   safe_clamp(cy, margin + 5.0, board.height - margin - 5.0)));
 
     // 5. Place remaining non-connector components using connectivity-greedy with seed-varied order
     let mut remaining: Vec<usize> = non_connector_indices
@@ -490,20 +490,68 @@ fn place_components_with_config(board: &mut Board, config: &PlacementConfig) {
     post_place_decoupling_near_ics(board);
 }
 
+/// Clamp that never panics: if min > max, returns midpoint.
+fn safe_clamp(val: f64, min: f64, max: f64) -> f64 {
+    if min > max {
+        (min + max) / 2.0
+    } else {
+        val.clamp(min, max)
+    }
+}
+
 /// Auto-calculate optimal board dimensions from component courtyard areas,
 /// the density factor, and the desired aspect ratio.
 ///
-/// Formula:
-///   board_area = sum(courtyard_areas) * density
-///   width  = sqrt(board_area * aspect_ratio)
-///   height = board_area / width
+/// Ensures all components fit by adjusting aspect_ratio and density if needed.
 fn auto_size_board(board: &mut Board) {
     let sizes = compute_placement_sizes(&board.components);
     let total_courtyard_area: f64 = sizes.iter().map(|(w, h)| w * h).sum();
-    let board_area = (total_courtyard_area * board.options.density).max(400.0); // min 20x20
-    let ar = board.aspect_ratio.max(0.1);
-    board.width = (board_area * ar).sqrt().max(20.0);
-    board.height = (board_area / board.width).max(20.0);
+
+    let margin = 5.0;
+    let min_margin = 2.0 * margin; // margins on both sides
+
+    // Find the largest component dimensions
+    let max_comp_width = sizes.iter().map(|(w, _)| *w).fold(0.0_f64, f64::max);
+    let max_comp_height = sizes.iter().map(|(_, h)| *h).fold(0.0_f64, f64::max);
+
+    let min_board_width = max_comp_width + min_margin;
+    let min_board_height = max_comp_height + min_margin;
+
+    let desired_ar = board.aspect_ratio.max(0.1);
+
+    // Ensure total area is large enough that both min dimensions can be satisfied
+    let min_area_for_components = min_board_width * min_board_height;
+    let mut density = board.options.density;
+    let mut board_area = (total_courtyard_area * density).max(400.0);
+
+    if total_courtyard_area > 0.0 && board_area < min_area_for_components {
+        let new_density = (min_area_for_components * 1.05) / total_courtyard_area;
+        density = new_density.max(density);
+        board_area = (total_courtyard_area * density).max(min_area_for_components);
+        eprintln!(
+            "⚠ Warning: density increased from {:.2} to {:.2} to fit all components",
+            board.options.density, density
+        );
+        board.options.density = density;
+    }
+    board_area = board_area.max(min_area_for_components);
+
+    // Calculate valid aspect_ratio range:
+    //   width = sqrt(area * ar) >= min_board_width  →  ar >= min_board_width² / area
+    //   height = sqrt(area / ar) >= min_board_height →  ar <= area / min_board_height²
+    let ar_min = (min_board_width * min_board_width) / board_area;
+    let ar_max = board_area / (min_board_height * min_board_height);
+
+    let ar = safe_clamp(desired_ar, ar_min, ar_max);
+    if (ar - desired_ar).abs() > 0.01 {
+        eprintln!(
+            "⚠ Warning: aspect_ratio adjusted from {:.2} to {:.2} to fit components (valid range: {:.2}–{:.2})",
+            desired_ar, ar, ar_min, ar_max
+        );
+    }
+
+    board.width = (board_area * ar).sqrt().max(min_board_width).max(20.0);
+    board.height = (board_area / board.width).max(min_board_height).max(20.0);
 }
 
 /// Find a non-overlapping position near (tx, ty) using spiral search.
@@ -554,8 +602,8 @@ fn find_non_overlapping(
         }
     }
     (
-        tx.clamp(min_x + mw / 2.0, max_x - mw / 2.0),
-        ty.clamp(min_y + mh / 2.0, max_y - mh / 2.0),
+        safe_clamp(tx, min_x + mw / 2.0, max_x - mw / 2.0),
+        safe_clamp(ty, min_y + mh / 2.0, max_y - mh / 2.0),
     )
 }
 
@@ -603,8 +651,8 @@ fn find_non_overlapping_with_step(
         }
     }
     (
-        tx.clamp(min_x + mw / 2.0, max_x - mw / 2.0),
-        ty.clamp(min_y + mh / 2.0, max_y - mh / 2.0),
+        safe_clamp(tx, min_x + mw / 2.0, max_x - mw / 2.0),
+        safe_clamp(ty, min_y + mh / 2.0, max_y - mh / 2.0),
     )
 }
 
@@ -621,10 +669,10 @@ fn find_edge_position(
     let hh = mh / 2.0;
 
     let mut candidates = vec![
-        (min_x + hw, near_y.clamp(min_y + hh, max_y - hh)),
-        (max_x - hw, near_y.clamp(min_y + hh, max_y - hh)),
-        (near_x.clamp(min_x + hw, max_x - hw), min_y + hh),
-        (near_x.clamp(min_x + hw, max_x - hw), max_y - hh),
+        (min_x + hw, safe_clamp(near_y, min_y + hh, max_y - hh)),
+        (max_x - hw, safe_clamp(near_y, min_y + hh, max_y - hh)),
+        (safe_clamp(near_x, min_x + hw, max_x - hw), min_y + hh),
+        (safe_clamp(near_x, min_x + hw, max_x - hw), max_y - hh),
     ];
     candidates.sort_by(|a, b| {
         let da = (a.0 - near_x).powi(2) + (a.1 - near_y).powi(2);
