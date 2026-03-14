@@ -1,0 +1,363 @@
+# PCB Forge - IoT Gateway
+# ESP32-S3 + LoRa + LTE Gateway
+
+[board]
+width = 80.0    # mm
+height = 60.0   # mm
+layers = 2
+trace_width = 0.25  # mm
+clearance = 0.2     # mm
+
+# ──────────────────────────────────────
+# Components
+# ──────────────────────────────────────
+
+[components.esp32]
+footprint = "RF_Module.pretty/ESP32-S3-WROOM-1.kicad_mod"
+value = "ESP32-S3-WROOM-1"
+lcsc = "C2913202"
+description = "Main MCU - WiFi/BLE + GPIO"
+
+# Pin numbers match ESP32-S3-WROOM-1 datasheet
+[components.esp32.pins]
+VCC = 2      # 3V3
+GND = 1
+IO10 = 18
+IO11 = 19
+IO12 = 20
+IO13 = 21
+IO14 = 22
+IO15 = 8
+IO16 = 9
+IO17 = 10
+IO18 = 11
+IO21 = 23
+TX0 = 37
+RX0 = 36
+EN = 3
+IO0 = 27
+
+[components.lora]
+footprint = "RF_Module.pretty/LORA1276-C1.kicad_mod"
+value = "LORA1276-C1-868MHz"
+lcsc = "C2976044"
+description = "LoRa transceiver module 868MHz"
+
+[components.lora.pins]
+VCC = 1
+GND = 2
+MOSI = 3
+MISO = 4
+SCK = 5
+NSS = 6
+NRESET = 7
+DIO0 = 8
+
+[components.lte]
+footprint = "RF_Module.pretty/SIMCOM-A7672E.kicad_mod"
+value = "A7672E"
+lcsc = "C5242292"
+description = "LTE Cat-1 module"
+
+[components.lte.pins]
+VBAT = 1
+GND = 2
+TXD = 3
+RXD = 4
+PWRKEY = 5
+RESET = 6
+NET_STATUS = 7
+SIM_VCC = 8
+SIM_RST = 9
+SIM_DATA = 10
+SIM_CLK = 11
+SIM_DET = 12
+
+[components.vreg]
+footprint = "Package_TO_SOT_SMD.pretty/SOT-223-3_TabPin2.kicad_mod"
+value = "AMS1117-3.3"
+lcsc = "C6186"
+description = "3.3V LDO voltage regulator"
+
+# SOT-223-3: pin 1 = GND, pin 2 = VOUT (also tab), pin 3 = VIN
+[components.vreg.pins]
+GND = 1
+VOUT = 2
+VIN = 3
+
+[components.usb]
+footprint = "Connector_USB.pretty/USB_C_Receptacle_GCT_USB4125-xx-x_6P_TopMnt_Horizontal.kicad_mod"
+value = "USB-C"
+lcsc = "C2765186"
+description = "USB Type-C connector for power and programming"
+
+# 6-pin USB-C: A5=CC1, A9=VBUS, A12=GND, B5=CC2, B9=VBUS, B12=GND
+[components.usb.pins]
+VBUS = "A9"
+GND = "A12"
+CC1 = "A5"
+CC2 = "B5"
+
+[components.battery]
+footprint = "Connector_JST.pretty/JST_PH_B2B-PH-K_1x02_P2.00mm_Vertical.kicad_mod"
+value = "JST-PH-2"
+lcsc = "C131337"
+description = "Battery connector JST-PH 2-pin"
+
+[components.battery.pins]
+VBAT = 1
+GND = 2
+
+[components.led_pwr]
+footprint = "LED_SMD.pretty/LED_0603_1608Metric.kicad_mod"
+value = "Green LED"
+lcsc = "C72043"
+description = "Power indicator LED"
+
+[components.led_pwr.pins]
+ANODE = 1
+CATHODE = 2
+
+[components.led_status]
+footprint = "LED_SMD.pretty/LED_0603_1608Metric.kicad_mod"
+value = "Blue LED"
+lcsc = "C72041"
+description = "Status indicator LED"
+
+[components.led_status.pins]
+ANODE = 1
+CATHODE = 2
+
+[components.btn_reset]
+footprint = "Button_Switch_SMD.pretty/SW_Push_1P1T_NO_CK_KMR2.kicad_mod"
+value = "Reset"
+lcsc = "C115357"
+description = "Reset button"
+
+[components.btn_reset.pins]
+A = 1
+B = 2
+
+[components.btn_boot]
+footprint = "Button_Switch_SMD.pretty/SW_Push_1P1T_NO_CK_KMR2.kicad_mod"
+value = "Boot"
+lcsc = "C115357"
+description = "Boot/Flash button"
+
+[components.btn_boot.pins]
+A = 1
+B = 2
+
+# Decoupling capacitors
+[components.c1]
+footprint = "Capacitor_SMD.pretty/C_0402_1005Metric.kicad_mod"
+value = "100nF"
+lcsc = "C1525"
+
+[components.c1.pins]
+P1 = 1
+P2 = 2
+
+[components.c2]
+footprint = "Capacitor_SMD.pretty/C_0402_1005Metric.kicad_mod"
+value = "100nF"
+lcsc = "C1525"
+
+[components.c2.pins]
+P1 = 1
+P2 = 2
+
+[components.c3]
+footprint = "Capacitor_SMD.pretty/C_0805_2012Metric.kicad_mod"
+value = "10uF"
+lcsc = "C15850"
+
+[components.c3.pins]
+P1 = 1
+P2 = 2
+
+[components.c4]
+footprint = "Capacitor_SMD.pretty/C_0805_2012Metric.kicad_mod"
+value = "22uF"
+lcsc = "C45783"
+
+[components.c4.pins]
+P1 = 1
+P2 = 2
+
+# Pull-up resistors for I2C (future use) and misc
+[components.r1]
+footprint = "Resistor_SMD.pretty/R_0402_1005Metric.kicad_mod"
+value = "10K"
+lcsc = "C25744"
+
+[components.r1.pins]
+P1 = 1
+P2 = 2
+
+[components.r2]
+footprint = "Resistor_SMD.pretty/R_0402_1005Metric.kicad_mod"
+value = "10K"
+lcsc = "C25744"
+
+[components.r2.pins]
+P1 = 1
+P2 = 2
+
+[components.r_led1]
+footprint = "Resistor_SMD.pretty/R_0402_1005Metric.kicad_mod"
+value = "1K"
+lcsc = "C11702"
+
+[components.r_led1.pins]
+P1 = 1
+P2 = 2
+
+[components.r_led2]
+footprint = "Resistor_SMD.pretty/R_0402_1005Metric.kicad_mod"
+value = "1K"
+lcsc = "C11702"
+
+[components.r_led2.pins]
+P1 = 1
+P2 = 2
+
+# CC resistors for USB-C
+[components.r_cc1]
+footprint = "Resistor_SMD.pretty/R_0402_1005Metric.kicad_mod"
+value = "5.1K"
+lcsc = "C25905"
+
+[components.r_cc1.pins]
+P1 = 1
+P2 = 2
+
+[components.r_cc2]
+footprint = "Resistor_SMD.pretty/R_0402_1005Metric.kicad_mod"
+value = "5.1K"
+lcsc = "C25905"
+
+[components.r_cc2.pins]
+P1 = 1
+P2 = 2
+
+# ──────────────────────────────────────
+# Nets (connections)
+# ──────────────────────────────────────
+
+# SPI bus: ESP32 ↔ LoRa
+[[nets]]
+name = "SPI_MOSI"
+pins = ["esp32.IO11", "lora.MOSI"]
+
+[[nets]]
+name = "SPI_MISO"
+pins = ["esp32.IO13", "lora.MISO"]
+
+[[nets]]
+name = "SPI_SCK"
+pins = ["esp32.IO12", "lora.SCK"]
+
+[[nets]]
+name = "LORA_NSS"
+pins = ["esp32.IO10", "lora.NSS"]
+
+[[nets]]
+name = "LORA_NRESET"
+pins = ["esp32.IO21", "lora.NRESET"]
+
+[[nets]]
+name = "LORA_DIO0"
+pins = ["esp32.IO14", "lora.DIO0"]
+
+# UART: ESP32 ↔ LTE
+[[nets]]
+name = "LTE_TX"
+pins = ["esp32.IO17", "lte.RXD"]
+
+[[nets]]
+name = "LTE_RX"
+pins = ["esp32.IO18", "lte.TXD"]
+
+[[nets]]
+name = "LTE_PWRKEY"
+pins = ["esp32.IO15", "lte.PWRKEY"]
+
+[[nets]]
+name = "LTE_RESET"
+pins = ["esp32.IO16", "lte.RESET"]
+
+# LTE VBAT direct from battery
+[[nets]]
+name = "VBAT"
+pins = ["battery.VBAT", "lte.VBAT"]
+
+# USB data lines removed (6-pin USB-C has no data pins)
+
+# USB-C CC resistors
+[[nets]]
+name = "USB_CC1"
+pins = ["usb.CC1", "r_cc1.P1"]
+
+[[nets]]
+name = "USB_CC2"
+pins = ["usb.CC2", "r_cc2.P1"]
+
+# Voltage regulator
+[[nets]]
+name = "VBUS"
+pins = ["usb.VBUS", "vreg.VIN", "c4.P1"]
+
+# LEDs with series resistors
+[[nets]]
+name = "LED_PWR_DRIVE"
+pins = ["r_led1.P1", "led_pwr.ANODE"]
+
+[[nets]]
+name = "LED_STATUS_DRIVE"
+pins = ["r_led2.P1", "led_status.ANODE"]
+
+# Reset button
+[[nets]]
+name = "ESP_EN"
+pins = ["esp32.EN", "r1.P1", "btn_reset.A"]
+
+# Boot button
+[[nets]]
+name = "ESP_IO0"
+pins = ["esp32.IO0", "r2.P1", "btn_boot.A"]
+
+# ──────────────────────────────────────
+# Power rails
+# ──────────────────────────────────────
+
+[power]
+vcc = [
+    "vreg.VOUT",
+    "esp32.VCC",
+    "lora.VCC",
+    "c1.P1",
+    "c2.P1",
+    "c3.P1",
+    "r1.P2",
+    "r2.P2",
+    "r_led1.P2",
+]
+gnd = [
+    "vreg.GND",
+    "esp32.GND",
+    "lora.GND",
+    "lte.GND",
+    "usb.GND",
+    "battery.GND",
+    "c1.P2",
+    "c2.P2",
+    "c3.P2",
+    "c4.P2",
+    "led_pwr.CATHODE",
+    "led_status.CATHODE",
+    "btn_reset.B",
+    "btn_boot.B",
+    "r_cc1.P2",
+    "r_cc2.P2",
+]

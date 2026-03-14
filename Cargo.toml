@@ -1,0 +1,18 @@
+[package]
+name = "pcb-forge"
+version = "0.1.0"
+edition = "2021"
+description = "Autonomous PCB design tool for Claude Code agents"
+license = "MIT"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+gerber-types = "0.7"
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"
+csv = "1"
+zip = "2"
+anyhow = "1"
+topola = { path = "../topola" }

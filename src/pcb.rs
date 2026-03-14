@@ -1,0 +1,561 @@
+use anyhow::Result;
+use std::io::Write;
+use std::path::Path;
+use uuid::Uuid;
+
+use crate::router::RoutedNet;
+use crate::schema::{Board, Component, Layer};
+
+pub fn generate_pcb(board: &mut Board, output: &Path) -> Result<()> {
+    // Step 1: Place components using connectivity-aware algorithm
+    place_components(board);
+
+    // Step 2: Generate KiCad PCB file
+    let mut buf = String::new();
+    write_pcb_header(&mut buf);
+    write_layers(&mut buf);
+    write_setup(&mut buf, board);
+    write_nets(&mut buf, board);
+    write_board_outline(&mut buf, board);
+    write_components(&mut buf, board);
+    write_zones(&mut buf, board);
+    buf.push_str(")\n");
+
+    let mut file = std::fs::File::create(output)?;
+    file.write_all(buf.as_bytes())?;
+
+    Ok(())
+}
+
+/// Place components using connectivity-aware algorithm.
+/// Groups connected components together, puts most-connected component at center.
+fn place_components(board: &mut Board) {
+    let margin = 5.0;
+    let n = board.components.len();
+    if n == 0 {
+        return;
+    }
+
+    // 1. Build connectivity adjacency matrix (weight = shared nets)
+    let mut adj = vec![vec![0usize; n]; n];
+    for net in &board.nets {
+        let mut comp_indices: Vec<usize> = Vec::new();
+        for pr in &net.pins {
+            if let Some(idx) = board.components.iter().position(|c| c.name == pr.component) {
+                if !comp_indices.contains(&idx) {
+                    comp_indices.push(idx);
+                }
+            }
+        }
+        for i in 0..comp_indices.len() {
+            for j in (i + 1)..comp_indices.len() {
+                adj[comp_indices[i]][comp_indices[j]] += 1;
+                adj[comp_indices[j]][comp_indices[i]] += 1;
+            }
+        }
+    }
+
+    // 2. Get component sizes for placement (use fab/pad bounds, not courtyard which includes keepouts)
+    let sizes: Vec<(f64, f64)> = board
+        .components
+        .iter()
+        .map(|c| {
+            if let Some(fp) = &c.footprint_data {
+                let (min_x, min_y, max_x, max_y) = fp.placement_bounds();
+                (max_x - min_x + 2.0, max_y - min_y + 2.0)
+            } else {
+                (12.0, 8.0)
+            }
+        })
+        .collect();
+
+    // 3. Find most connected component → place at center
+    let total_conn: Vec<usize> = (0..n).map(|i| adj[i].iter().sum()).collect();
+    let center_idx = total_conn
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, &v)| v)
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+
+    let cx = board.width / 2.0;
+    let cy = board.height / 2.0;
+    let mut positions: Vec<Option<(f64, f64)>> = vec![None; n];
+    positions[center_idx] = Some((cx, cy));
+
+    // 4. Place remaining components near their most-connected placed neighbor
+    let mut remaining: Vec<usize> = (0..n).filter(|&i| i != center_idx).collect();
+
+    while !remaining.is_empty() {
+        let mut best_ri = 0;
+        let mut best_score = 0usize;
+        let mut best_neighbor = center_idx;
+
+        for (ri, &comp_idx) in remaining.iter().enumerate() {
+            for placed_idx in 0..n {
+                if positions[placed_idx].is_none() {
+                    continue;
+                }
+                if adj[comp_idx][placed_idx] > best_score {
+                    best_score = adj[comp_idx][placed_idx];
+                    best_ri = ri;
+                    best_neighbor = placed_idx;
+                }
+            }
+        }
+
+        let comp_idx = remaining.remove(best_ri);
+        let (target_x, target_y) = positions[best_neighbor].unwrap_or((cx, cy));
+
+        // Connectors should be near board edges
+        let fp_lower = board.components[comp_idx].footprint.to_lowercase();
+        let is_connector = fp_lower.contains("connector")
+            || fp_lower.contains("usb")
+            || fp_lower.contains("jst");
+
+        let (px, py) = if is_connector {
+            find_edge_position(
+                &sizes, &positions, comp_idx, target_x, target_y,
+                margin, board.width - margin, margin, board.height - margin,
+            )
+        } else {
+            find_non_overlapping(
+                target_x, target_y, &sizes, &positions, comp_idx,
+                margin, board.width - margin, margin, board.height - margin,
+            )
+        };
+
+        positions[comp_idx] = Some((px, py));
+    }
+
+    // 5. Apply positions and report
+    for (i, comp) in board.components.iter_mut().enumerate() {
+        if let Some((x, y)) = positions[i] {
+            comp.x = x;
+            comp.y = y;
+        }
+    }
+
+}
+
+/// Find a non-overlapping position near (tx, ty) using spiral search.
+fn find_non_overlapping(
+    tx: f64, ty: f64,
+    sizes: &[(f64, f64)],
+    positions: &[Option<(f64, f64)>],
+    my_idx: usize,
+    min_x: f64, max_x: f64, min_y: f64, max_y: f64,
+) -> (f64, f64) {
+    let (mw, mh) = sizes[my_idx];
+    let step = 1.5;
+
+    for r in 0..80 {
+        let radius = r as f64 * step;
+        let points: Vec<(f64, f64)> = if r == 0 {
+            vec![(tx, ty)]
+        } else {
+            let n_pts = (r * 8).max(8) as usize;
+            (0..n_pts)
+                .map(|i| {
+                    let a = 2.0 * std::f64::consts::PI * i as f64 / n_pts as f64;
+                    (tx + radius * a.cos(), ty + radius * a.sin())
+                })
+                .collect()
+        };
+
+        for (px, py) in points {
+            let hw = mw / 2.0;
+            let hh = mh / 2.0;
+            if px - hw < min_x || px + hw > max_x || py - hh < min_y || py + hh > max_y {
+                continue;
+            }
+            let overlaps = positions.iter().enumerate().any(|(i, pos)| {
+                if i == my_idx {
+                    return false;
+                }
+                if let Some((cx, cy)) = pos {
+                    let (cw, ch) = sizes[i];
+                    (px - cx).abs() < (hw + cw / 2.0) && (py - cy).abs() < (hh + ch / 2.0)
+                } else {
+                    false
+                }
+            });
+            if !overlaps {
+                return (px, py);
+            }
+        }
+    }
+    (
+        tx.clamp(min_x + mw / 2.0, max_x - mw / 2.0),
+        ty.clamp(min_y + mh / 2.0, max_y - mh / 2.0),
+    )
+}
+
+/// Find position near board edge, close to (near_x, near_y).
+fn find_edge_position(
+    sizes: &[(f64, f64)],
+    positions: &[Option<(f64, f64)>],
+    my_idx: usize,
+    near_x: f64, near_y: f64,
+    min_x: f64, max_x: f64, min_y: f64, max_y: f64,
+) -> (f64, f64) {
+    let (mw, mh) = sizes[my_idx];
+    let hw = mw / 2.0;
+    let hh = mh / 2.0;
+
+    let mut candidates = vec![
+        (min_x + hw, near_y.clamp(min_y + hh, max_y - hh)),
+        (max_x - hw, near_y.clamp(min_y + hh, max_y - hh)),
+        (near_x.clamp(min_x + hw, max_x - hw), min_y + hh),
+        (near_x.clamp(min_x + hw, max_x - hw), max_y - hh),
+    ];
+    candidates.sort_by(|a, b| {
+        let da = (a.0 - near_x).powi(2) + (a.1 - near_y).powi(2);
+        let db = (b.0 - near_x).powi(2) + (b.1 - near_y).powi(2);
+        da.partial_cmp(&db).unwrap()
+    });
+
+    for (px, py) in &candidates {
+        let overlaps = positions.iter().enumerate().any(|(i, pos)| {
+            if i == my_idx { return false; }
+            if let Some((cx, cy)) = pos {
+                let (cw, ch) = sizes[i];
+                (px - cx).abs() < (hw + cw / 2.0) && (py - cy).abs() < (hh + ch / 2.0)
+            } else { false }
+        });
+        if !overlaps {
+            return (*px, *py);
+        }
+    }
+
+    // Try offset positions along edges
+    for (bx, by) in &candidates {
+        for offset in 1..20 {
+            let s = offset as f64 * 3.0;
+            for &(dx, dy) in &[(s, 0.0), (-s, 0.0), (0.0, s), (0.0, -s)] {
+                let px = bx + dx;
+                let py = by + dy;
+                if px - hw < min_x || px + hw > max_x || py - hh < min_y || py + hh > max_y {
+                    continue;
+                }
+                let overlaps = positions.iter().enumerate().any(|(i, pos)| {
+                    if i == my_idx { return false; }
+                    if let Some((cx, cy)) = pos {
+                        let (cw, ch) = sizes[i];
+                        (px - cx).abs() < (hw + cw / 2.0) && (py - cy).abs() < (hh + ch / 2.0)
+                    } else { false }
+                });
+                if !overlaps {
+                    return (px, py);
+                }
+            }
+        }
+    }
+
+    find_non_overlapping(near_x, near_y, sizes, positions, my_idx, min_x, max_x, min_y, max_y)
+}
+
+/// Write copper pour zone definitions for power nets.
+fn write_zones(buf: &mut String, board: &Board) {
+    // GND zone on B.Cu (full ground plane)
+    if let Some(gnd_idx) = board.nets.iter().position(|n| n.name == "GND") {
+        buf.push_str(&format!(
+            "  (zone (net {}) (net_name \"GND\") (layer \"B.Cu\") (uuid \"{}\")\n",
+            gnd_idx + 1, Uuid::new_v4()
+        ));
+        buf.push_str("    (fill yes (thermal_gap 0.5) (thermal_bridge_width 0.5))\n");
+        buf.push_str(&format!(
+            "    (polygon (pts\n      (xy 0 0) (xy {} 0) (xy {} {}) (xy 0 {})\n    ))\n",
+            board.width, board.width, board.height, board.height
+        ));
+        buf.push_str("  )\n\n");
+    }
+
+    // VCC3V3 zone on F.Cu (lower priority, fills around signals)
+    if let Some(vcc_idx) = board.nets.iter().position(|n| n.name == "VCC3V3") {
+        buf.push_str(&format!(
+            "  (zone (net {}) (net_name \"VCC3V3\") (layer \"F.Cu\") (uuid \"{}\")\n",
+            vcc_idx + 1, Uuid::new_v4()
+        ));
+        buf.push_str("    (fill yes (thermal_gap 0.5) (thermal_bridge_width 0.5))\n");
+        buf.push_str("    (priority 1)\n");
+        buf.push_str(&format!(
+            "    (polygon (pts\n      (xy 0 0) (xy {} 0) (xy {} {}) (xy 0 {})\n    ))\n",
+            board.width, board.width, board.height, board.height
+        ));
+        buf.push_str("  )\n\n");
+    }
+}
+
+fn write_pcb_header(buf: &mut String) {
+    buf.push_str("(kicad_pcb\n");
+    buf.push_str("  (version 20240108)\n");
+    buf.push_str("  (generator \"pcb-forge\")\n");
+    buf.push_str("  (generator_version \"0.1.0\")\n");
+    buf.push_str("  (general\n    (thickness 1.6)\n    (legacy_teardrops no)\n  )\n");
+    buf.push_str("  (paper \"A4\")\n");
+}
+
+fn write_layers(buf: &mut String) {
+    buf.push_str("  (layers\n");
+    buf.push_str("    (0 \"F.Cu\" signal)\n");
+    buf.push_str("    (31 \"B.Cu\" signal)\n");
+    buf.push_str("    (32 \"B.Adhes\" user \"B.Adhesive\")\n");
+    buf.push_str("    (33 \"F.Adhes\" user \"F.Adhesive\")\n");
+    buf.push_str("    (34 \"B.Paste\" user)\n");
+    buf.push_str("    (35 \"F.Paste\" user)\n");
+    buf.push_str("    (36 \"B.SilkS\" user \"B.Silkscreen\")\n");
+    buf.push_str("    (37 \"F.SilkS\" user \"F.Silkscreen\")\n");
+    buf.push_str("    (38 \"B.Mask\" user)\n");
+    buf.push_str("    (39 \"F.Mask\" user)\n");
+    buf.push_str("    (40 \"Dwgs.User\" user \"User.Drawings\")\n");
+    buf.push_str("    (41 \"Cmts.User\" user \"User.Comments\")\n");
+    buf.push_str("    (42 \"Eco1.User\" user \"User.Eco1\")\n");
+    buf.push_str("    (43 \"Eco2.User\" user \"User.Eco2\")\n");
+    buf.push_str("    (44 \"Edge.Cuts\" user)\n");
+    buf.push_str("    (45 \"Margin\" user)\n");
+    buf.push_str("    (46 \"B.CrtYd\" user \"B.Courtyard\")\n");
+    buf.push_str("    (47 \"F.CrtYd\" user \"F.Courtyard\")\n");
+    buf.push_str("    (48 \"B.Fab\" user)\n");
+    buf.push_str("    (49 \"F.Fab\" user)\n");
+    buf.push_str("  )\n\n");
+}
+
+fn write_setup(buf: &mut String, board: &Board) {
+    buf.push_str("  (setup\n");
+    buf.push_str("    (pad_to_mask_clearance 0.05)\n");
+    buf.push_str("    (pcbplotparams\n");
+    buf.push_str("      (layerselection 0x00010fc_ffffffff)\n");
+    buf.push_str("      (plot_on_all_layers_selection 0x0000000_00000000)\n");
+    buf.push_str("      (disableapertmacros no)\n");
+    buf.push_str("      (usegerberextensions yes)\n");
+    buf.push_str("      (usegerberattributes yes)\n");
+    buf.push_str("      (usegerberadvancedattributes yes)\n");
+    buf.push_str("      (creategerberjobfile yes)\n");
+    buf.push_str("      (dashed_line_dash_ratio 12.000000)\n");
+    buf.push_str("      (dashed_line_gap_ratio 3.000000)\n");
+    buf.push_str("      (svgprecision 4)\n");
+    buf.push_str("      (plotframeref no)\n");
+    buf.push_str("      (viasonmask no)\n");
+    buf.push_str("      (mode 1)\n");
+    buf.push_str("      (useauxorigin no)\n");
+    buf.push_str("      (hpglpennumber 1)\n");
+    buf.push_str("      (hpglpenspeed 20)\n");
+    buf.push_str("      (hpglpendiameter 15.000000)\n");
+    buf.push_str("      (pdf_front_fp_property_popups yes)\n");
+    buf.push_str("      (pdf_back_fp_property_popups yes)\n");
+    buf.push_str("      (pdf_metadata yes)\n");
+    buf.push_str("      (excludeedgelayer yes)\n");
+    buf.push_str(&format!(
+        "      (linewidth {})\n",
+        board.trace_width / 1000.0
+    ));
+    buf.push_str("      (plotinvisibletext no)\n");
+    buf.push_str("      (sketchpadsonfab no)\n");
+    buf.push_str("      (subtractmaskfromsilk no)\n");
+    buf.push_str("      (outputformat 1)\n");
+    buf.push_str("      (mirror no)\n");
+    buf.push_str("      (drillshape 1)\n");
+    buf.push_str("      (scaleselection 1)\n");
+    buf.push_str("      (outputdirectory \"\")\n");
+    buf.push_str("    )\n");
+    buf.push_str("  )\n\n");
+}
+
+fn write_nets(buf: &mut String, board: &Board) {
+    buf.push_str("  (net 0 \"\")\n");
+    for (i, net) in board.nets.iter().enumerate() {
+        buf.push_str(&format!("  (net {} \"{}\")\n", i + 1, net.name));
+    }
+    buf.push_str("\n");
+}
+
+fn write_board_outline(buf: &mut String, board: &Board) {
+    let layer = Layer::EdgeCuts.name();
+    buf.push_str(&format!(
+        "  (gr_rect (start 0 0) (end {} {})\n    (stroke (width 0.05) (type default))\n    (fill none)\n    (layer \"{}\")\n    (uuid \"{}\")\n  )\n\n",
+        board.width, board.height, layer, Uuid::new_v4()
+    ));
+}
+
+fn write_components(buf: &mut String, board: &Board) {
+    for comp in &board.components {
+        write_footprint(buf, comp, board);
+    }
+}
+
+fn write_footprint(buf: &mut String, comp: &Component, board: &Board) {
+    let fp_uuid = Uuid::new_v4();
+
+    buf.push_str(&format!("  (footprint \"{}\"\n", comp.footprint));
+    buf.push_str("    (layer \"F.Cu\")\n");
+    buf.push_str(&format!("    (uuid \"{}\")\n", fp_uuid));
+    buf.push_str(&format!("    (at {} {})\n", comp.x, comp.y));
+
+    // Properties
+    buf.push_str(&format!(
+        "    (property \"Reference\" \"{}\"\n      (at 0 -3 0)\n      (layer \"F.SilkS\")\n      (uuid \"{}\")\n      (effects (font (size 1 1) (thickness 0.15)))\n    )\n",
+        comp.ref_des, Uuid::new_v4()
+    ));
+    buf.push_str(&format!(
+        "    (property \"Value\" \"{}\"\n      (at 0 3 0)\n      (layer \"F.Fab\")\n      (uuid \"{}\")\n      (effects (font (size 1 1) (thickness 0.15)))\n    )\n",
+        comp.value, Uuid::new_v4()
+    ));
+    buf.push_str(&format!(
+        "    (property \"Footprint\" \"{}\"\n      (at 0 0 0)\n      (layer \"F.Fab\")\n      (uuid \"{}\")\n      (effects (font (size 1.27 1.27) (thickness 0.15)) hide)\n    )\n",
+        comp.footprint, Uuid::new_v4()
+    ));
+
+    if let Some(fp) = &comp.footprint_data {
+        // Write real footprint lines (courtyard, fab, silkscreen)
+        for line in &fp.lines {
+            buf.push_str(&format!(
+                "    (fp_line (start {} {}) (end {} {})\n      (stroke (width {}) (type solid))\n      (layer \"{}\")\n      (uuid \"{}\")\n    )\n",
+                line.start.0, line.start.1, line.end.0, line.end.1,
+                line.width, line.layer, Uuid::new_v4()
+            ));
+        }
+
+        // Write real pads with net assignments
+        for pad in &fp.pads {
+            if pad.number.is_empty() && !pad.layers.iter().any(|l| l.contains("Cu")) {
+                continue; // skip paste-only helper pads
+            }
+
+            let net_str = find_net_for_pad(comp, &pad.number, board);
+
+            let layers_str = pad.layers.join("\" \"");
+
+            let drill_str = if let Some(d) = pad.drill {
+                format!("\n      (drill {})", d)
+            } else {
+                String::new()
+            };
+
+            buf.push_str(&format!(
+                "    (pad \"{}\" {} {} (at {} {}) (size {} {}){}\n      (layers \"{}\")\n      {}\n      (uuid \"{}\")\n    )\n",
+                pad.number, pad.pad_type, pad.shape,
+                pad.at_x, pad.at_y,
+                pad.size_w, pad.size_h,
+                drill_str,
+                layers_str,
+                net_str,
+                Uuid::new_v4()
+            ));
+        }
+    } else {
+        // Fallback: generic pads (legacy behavior)
+        write_generic_footprint(buf, comp);
+    }
+
+    buf.push_str("  )\n\n");
+}
+
+/// Find net assignment string for a given pad number on a component.
+fn find_net_for_pad(comp: &Component, pad_number: &str, board: &Board) -> String {
+    // Find which pin has this pad number
+    let pin = comp.pins.iter().find(|p| p.number == pad_number);
+    if let Some(pin) = pin {
+        // Find which net this pin belongs to
+        for (i, net) in board.nets.iter().enumerate() {
+            for pin_ref in &net.pins {
+                if pin_ref.component == comp.name && pin_ref.pin == pin.name {
+                    return format!("(net {} \"{}\")", i + 1, net.name);
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+/// Append routed traces and vias to an existing .kicad_pcb file.
+/// This must be called after generate_pcb() and after routing is complete.
+pub fn append_routed_traces(
+    pcb_path: &Path,
+    board: &Board,
+    routed_nets: &[RoutedNet],
+) -> Result<()> {
+    let mut content = std::fs::read_to_string(pcb_path)?;
+
+    // Remove trailing ")\n" to insert traces before close
+    let trimmed = content.trim_end();
+    if trimmed.ends_with(')') {
+        content = trimmed[..trimmed.len() - 1].to_string();
+        content.push('\n');
+    }
+
+    // Build net name → index map (net 0 is empty/unassigned in KiCad)
+    let net_indices: std::collections::HashMap<&str, usize> = board
+        .nets
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.name.as_str(), i + 1))
+        .collect();
+
+    // Write trace segments
+    for rn in routed_nets {
+        let net_idx = net_indices.get(rn.name.as_str()).copied().unwrap_or(0);
+
+        for seg in &rn.segments {
+            let layer = if seg.layer == 0 { "F.Cu" } else { "B.Cu" };
+            content.push_str(&format!(
+                "  (segment (start {} {}) (end {} {}) (width {}) (layer \"{}\") (net {}) (uuid \"{}\"))\n",
+                seg.start.0, seg.start.1, seg.end.0, seg.end.1,
+                seg.width, layer, net_idx, Uuid::new_v4()
+            ));
+        }
+
+        for via in &rn.vias {
+            content.push_str(&format!(
+                "  (via (at {} {}) (size {}) (drill {}) (layers \"F.Cu\" \"B.Cu\") (net {}) (uuid \"{}\"))\n",
+                via.x, via.y, via.size, via.drill, net_idx, Uuid::new_v4()
+            ));
+        }
+    }
+
+    content.push_str(")\n");
+
+    std::fs::write(pcb_path, &content)?;
+    Ok(())
+}
+
+fn write_generic_footprint(buf: &mut String, comp: &Component) {
+    let pin_count = comp.pins.len();
+    let body_w = 8.0_f64.max(pin_count as f64 * 1.0);
+    let body_h = 6.0_f64.max(pin_count as f64 * 0.8);
+
+    // Courtyard
+    buf.push_str(&format!(
+        "    (fp_rect (start {} {}) (end {} {})\n      (stroke (width 0.05) (type default))\n      (fill none)\n      (layer \"F.CrtYd\")\n      (uuid \"{}\")\n    )\n",
+        -body_w / 2.0, -body_h / 2.0,
+        body_w / 2.0, body_h / 2.0,
+        Uuid::new_v4()
+    ));
+
+    // Fab layer
+    buf.push_str(&format!(
+        "    (fp_rect (start {} {}) (end {} {})\n      (stroke (width 0.1) (type default))\n      (fill none)\n      (layer \"F.Fab\")\n      (uuid \"{}\")\n    )\n",
+        -(body_w - 0.5) / 2.0, -(body_h - 0.5) / 2.0,
+        (body_w - 0.5) / 2.0, (body_h - 0.5) / 2.0,
+        Uuid::new_v4()
+    ));
+
+    // Generic pads
+    let half = (pin_count + 1) / 2;
+    for (i, pin) in comp.pins.iter().enumerate() {
+        let (pad_x, pad_y) = if i < half {
+            let py = -(half as f64 - 1.0) * 1.27 / 2.0 + i as f64 * 1.27;
+            (-(body_w / 2.0 - 0.5), py)
+        } else {
+            let ri = i - half;
+            let right_count = pin_count - half;
+            let py = -(right_count as f64 - 1.0) * 1.27 / 2.0 + ri as f64 * 1.27;
+            (body_w / 2.0 - 0.5, py)
+        };
+
+        buf.push_str(&format!(
+            "    (pad \"{}\" smd rect (at {} {}) (size 1.5 0.6)\n      (layers \"F.Cu\" \"F.Paste\" \"F.Mask\")\n      (uuid \"{}\")\n    )\n",
+            pin.number, pad_x, pad_y, Uuid::new_v4()
+        ));
+    }
+}
