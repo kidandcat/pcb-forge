@@ -108,7 +108,6 @@ fn build_board(def: CircuitDefinition) -> Result<Board> {
         // Apply real pad positions to pins
         let pins = apply_pad_positions(pins, &footprint_data);
 
-        let manually_placed = comp_def.x.is_some() && comp_def.y.is_some();
         components.push(Component {
             ref_des,
             name: name.clone(),
@@ -118,10 +117,9 @@ fn build_board(def: CircuitDefinition) -> Result<Board> {
             pins,
             description: comp_def.description.clone(),
             footprint_data: Some(footprint_data),
-            x: comp_def.x.unwrap_or(0.0),
-            y: comp_def.y.unwrap_or(0.0),
-            rotation: comp_def.rotation.unwrap_or(0.0),
-            manually_placed,
+            x: 0.0,
+            y: 0.0,
+            rotation: 0.0,
         });
     }
 

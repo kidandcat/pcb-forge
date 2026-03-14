@@ -7,18 +7,19 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
+use crate::pcb::PlacementScore;
 use crate::router::RoutedNet;
 use crate::{bom, gerber, pcb, router, schematic, topola_router, viewer};
 
 use super::frontend;
-use super::server::{BuildStatus, SharedState};
+use super::server::{BuildStatus, PlacementVariant, SharedState};
 
 // GET / — serve HTML frontend
 pub async fn index() -> Html<&'static str> {
     Html(frontend::HTML)
 }
 
-// GET /api/board — return board state as JSON
+// GET /api/board — return board state as JSON (uses selected variant if available)
 pub async fn get_board(State(state): State<SharedState>) -> impl IntoResponse {
     let st = state.read().await;
 
@@ -27,6 +28,14 @@ pub async fn get_board(State(state): State<SharedState>) -> impl IntoResponse {
         board: BoardJson,
         routed_nets: Option<Vec<RoutedNet>>,
         has_build: bool,
+        variants: Vec<VariantSummary>,
+        selected_variant: usize,
+    }
+
+    #[derive(Serialize)]
+    struct VariantSummary {
+        index: usize,
+        score: PlacementScore,
     }
 
     #[derive(Serialize)]
@@ -49,7 +58,6 @@ pub async fn get_board(State(state): State<SharedState>) -> impl IntoResponse {
         x: f64,
         y: f64,
         rotation: f64,
-        manually_placed: bool,
         pins: Vec<PinJson>,
         footprint_data: Option<FootprintDataJson>,
     }
@@ -102,14 +110,22 @@ pub async fn get_board(State(state): State<SharedState>) -> impl IntoResponse {
         pin: String,
     }
 
+    // Use selected variant's board if available, otherwise the template board
+    let (active_board, routed_nets) = if !st.variants.is_empty() {
+        let idx = st.selected_variant.min(st.variants.len() - 1);
+        let v = &st.variants[idx];
+        (&v.board, Some(v.routed_nets.clone()))
+    } else {
+        (&st.board, None)
+    };
+
     let board_json = BoardJson {
-        width: st.board.width,
-        height: st.board.height,
-        layers: st.board.layers,
-        trace_width: st.board.trace_width,
-        clearance: st.board.clearance,
-        components: st
-            .board
+        width: active_board.width,
+        height: active_board.height,
+        layers: active_board.layers,
+        trace_width: active_board.trace_width,
+        clearance: active_board.clearance,
+        components: active_board
             .components
             .iter()
             .map(|c| ComponentJson {
@@ -120,7 +136,6 @@ pub async fn get_board(State(state): State<SharedState>) -> impl IntoResponse {
                 x: c.x,
                 y: c.y,
                 rotation: c.rotation,
-                manually_placed: c.manually_placed,
                 pins: c
                     .pins
                     .iter()
@@ -161,8 +176,7 @@ pub async fn get_board(State(state): State<SharedState>) -> impl IntoResponse {
                 }),
             })
             .collect(),
-        nets: st
-            .board
+        nets: active_board
             .nets
             .iter()
             .map(|n| NetJson {
@@ -179,10 +193,22 @@ pub async fn get_board(State(state): State<SharedState>) -> impl IntoResponse {
             .collect(),
     };
 
+    let variant_summaries: Vec<VariantSummary> = st
+        .variants
+        .iter()
+        .enumerate()
+        .map(|(i, v)| VariantSummary {
+            index: i,
+            score: v.score.clone(),
+        })
+        .collect();
+
     let resp = BoardResponse {
-        has_build: st.routed_nets.is_some(),
-        routed_nets: st.routed_nets.clone(),
+        has_build: !st.variants.is_empty(),
+        routed_nets,
         board: board_json,
+        variants: variant_summaries,
+        selected_variant: st.selected_variant,
     };
 
     Json(resp)
@@ -218,8 +244,8 @@ pub async fn update_component(
         if let Some(r) = update.rotation {
             comp.rotation = r;
         }
-        // Invalidate routes since positions changed
-        st.routed_nets = None;
+        // Invalidate build since positions changed
+        st.variants.clear();
         (StatusCode::OK, Json(serde_json::json!({"ok": true})))
     } else {
         (
@@ -247,14 +273,51 @@ pub async fn update_board_size(
     if let Some(h) = update.height {
         st.board.height = h;
     }
-    // Invalidate routes
-    st.routed_nets = None;
+    st.variants.clear();
     Json(serde_json::json!({"ok": true}))
 }
 
-// POST /api/build — run full build pipeline, return SSE stream
+// GET /api/variant/:index — get a specific variant's board data
+pub async fn get_variant(
+    State(state): State<SharedState>,
+    Path(index): Path<usize>,
+) -> impl IntoResponse {
+    let st = state.read().await;
+    if index >= st.variants.len() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Variant not found"})),
+        )
+            .into_response();
+    }
+
+    let v = &st.variants[index];
+    Json(serde_json::json!({
+        "index": index,
+        "score": v.score,
+        "routed_nets": v.routed_nets,
+    }))
+    .into_response()
+}
+
+// POST /api/variant/:index/select — select a variant as active
+pub async fn select_variant(
+    State(state): State<SharedState>,
+    Path(index): Path<usize>,
+) -> impl IntoResponse {
+    let mut st = state.write().await;
+    if index >= st.variants.len() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Variant not found"})),
+        );
+    }
+    st.selected_variant = index;
+    (StatusCode::OK, Json(serde_json::json!({"ok": true, "selected": index})))
+}
+
+// POST /api/build — run full build pipeline with 10 placement variants, return SSE stream
 pub async fn trigger_build(State(state): State<SharedState>) -> Response {
-    // Check if already building
     {
         let st = state.read().await;
         if st.build_status.running {
@@ -266,7 +329,6 @@ pub async fn trigger_build(State(state): State<SharedState>) -> Response {
         }
     }
 
-    // Set building state
     {
         let mut st = state.write().await;
         st.build_status = BuildStatus {
@@ -279,7 +341,6 @@ pub async fn trigger_build(State(state): State<SharedState>) -> Response {
         st.build_log.clear();
     }
 
-    // Run build in background, streaming SSE events
     let state_clone = state.clone();
     let (tx, rx) = tokio::sync::mpsc::channel::<String>(32);
 
@@ -287,7 +348,6 @@ pub async fn trigger_build(State(state): State<SharedState>) -> Response {
         run_build(state_clone, tx).await;
     });
 
-    // Convert mpsc receiver to SSE stream
     let rx_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     let stream = tokio_stream::StreamExt::map(rx_stream, Ok::<_, std::convert::Infallible>);
 
@@ -302,11 +362,10 @@ pub async fn trigger_build(State(state): State<SharedState>) -> Response {
 
 async fn run_build(state: SharedState, tx: tokio::sync::mpsc::Sender<String>) {
     let send_event = |step: &str, progress: u8| {
-        let msg = format!(
+        format!(
             "data: {}\n\n",
             serde_json::json!({"step": step, "progress": progress})
-        );
-        msg
+        )
     };
 
     macro_rules! update_status {
@@ -320,18 +379,11 @@ async fn run_build(state: SharedState, tx: tokio::sync::mpsc::Sender<String>) {
         }};
     }
 
-    // Clone what we need
-    let (mut board, output_dir, use_topola, _input_path) = {
+    let (board, output_dir, use_topola) = {
         let st = state.read().await;
-        (
-            st.board.clone(),
-            st.output_dir.clone(),
-            st.use_topola,
-            st.input_path.clone(),
-        )
+        (st.board.clone(), st.output_dir.clone(), st.use_topola)
     };
 
-    // Step 1: create output dir
     update_status!("Creating output directory...", 5);
     if let Err(e) = std::fs::create_dir_all(&output_dir) {
         let mut st = state.write().await;
@@ -346,93 +398,78 @@ async fn run_build(state: SharedState, tx: tokio::sync::mpsc::Sender<String>) {
         return;
     }
 
-    // Step 2: Generate schematic
-    update_status!("Generating schematic...", 10);
+    // Generate schematic
+    update_status!("Generating schematic...", 8);
     let sch_path = output_dir.join("pcb-forge.kicad_sch");
     if let Err(e) = schematic::generate_schematic(&board, &sch_path) {
         finish_with_error(&state, &tx, &format!("Schematic: {}", e)).await;
         return;
     }
 
-    // Step 3: Generate PCB layout
-    update_status!("Generating PCB layout...", 25);
-    let pcb_path = output_dir.join("pcb-forge.kicad_pcb");
-    if let Err(e) = pcb::generate_pcb(&mut board, &pcb_path) {
-        finish_with_error(&state, &tx, &format!("PCB layout: {}", e)).await;
-        return;
-    }
+    // Generate 10 placement variants and route each
+    update_status!("Generating placement variants...", 10);
+    let configs = pcb::generate_placement_configs();
+    let mut all_variants: Vec<PlacementVariant> = Vec::new();
 
-    // Update board in state (placement may have been adjusted)
-    {
-        let mut st = state.write().await;
-        st.board = board.clone();
-    }
+    for (i, config) in configs.iter().enumerate() {
+        let progress = 10 + (i as u8) * 7; // 10-80%
+        update_status!(
+            &format!("Placing & routing variant {}/10...", i + 1),
+            progress
+        );
 
-    // Step 4: Route traces
-    update_status!("Routing traces...", 40);
-    let routed_nets = if use_topola {
-        match topola_router::route_with_topola(&board) {
-            Ok(nets) => nets,
-            Err(e) => {
-                finish_with_error(&state, &tx, &format!("Routing: {}", e)).await;
-                return;
+        let placed_board = pcb::generate_placement(&board, config);
+        let routed_nets = if use_topola {
+            match topola_router::route_with_topola(&placed_board) {
+                Ok(nets) => nets,
+                Err(_) => continue,
             }
-        }
-    } else {
-        let mut r = router::Router::new(board.width, board.height, 0.1);
-        r.route_all(&board)
-    };
+        } else {
+            let mut r = router::Router::new(placed_board.width, placed_board.height, 0.1);
+            r.route_all(&placed_board)
+        };
 
-    // Append routed traces
-    update_status!("Writing routed traces...", 55);
-    if let Err(e) = pcb::append_routed_traces(&pcb_path, &board, &routed_nets) {
-        finish_with_error(&state, &tx, &format!("Trace append: {}", e)).await;
-        return;
+        let score = pcb::PlacementScore::compute(&routed_nets, board.nets.len());
+        all_variants.push(PlacementVariant {
+            board: placed_board,
+            routed_nets,
+            score,
+        });
     }
 
-    // Step 5: Generate Gerbers
-    update_status!("Generating Gerber files...", 65);
-    let gerber_dir = output_dir.join("gerbers");
-    if let Err(e) = gerber::generate_gerbers(&board, &routed_nets, &gerber_dir) {
-        finish_with_error(&state, &tx, &format!("Gerbers: {}", e)).await;
-        return;
+    // Sort by score and take top 3
+    all_variants.sort_by(|a, b| b.score.composite.partial_cmp(&a.score.composite).unwrap());
+    let top3: Vec<PlacementVariant> = all_variants.into_iter().take(3).collect();
+
+    // Generate output files for top 3
+    update_status!("Generating outputs for top 3...", 82);
+    for (rank, variant) in top3.iter().enumerate() {
+        let variant_dir = output_dir.join(format!("placement-{}", rank + 1));
+        let _ = std::fs::create_dir_all(&variant_dir);
+
+        let pcb_path = variant_dir.join("pcb-forge.kicad_pcb");
+        let _ = pcb::write_pcb_file(&variant.board, &pcb_path);
+        let _ = pcb::append_routed_traces(&pcb_path, &variant.board, &variant.routed_nets);
+
+        let gerber_dir = variant_dir.join("gerbers");
+        let _ = gerber::generate_gerbers(&variant.board, &variant.routed_nets, &gerber_dir);
+        let _ = bom::generate_bom(&variant.board, &variant_dir);
+
+        let zip_path = variant_dir.join("jlcpcb.zip");
+        let _ = create_jlcpcb_zip(&gerber_dir, &variant_dir, &zip_path);
+
+        let viewer_path = variant_dir.join("viewer.html");
+        let _ = viewer::generate_viewer(&variant.board, &variant.routed_nets, &viewer_path);
+
+        let png_path = variant_dir.join("pcb-preview.png");
+        let _ = viewer::generate_png(&variant.board, &variant.routed_nets, &png_path);
     }
 
-    // Step 6: Generate BOM
-    update_status!("Generating BOM...", 75);
-    if let Err(e) = bom::generate_bom(&board, &output_dir) {
-        finish_with_error(&state, &tx, &format!("BOM: {}", e)).await;
-        return;
-    }
-
-    // Step 7: Create JLCPCB ZIP
-    update_status!("Creating JLCPCB ZIP...", 82);
-    let zip_path = output_dir.join("jlcpcb.zip");
-    if let Err(e) = create_jlcpcb_zip(&gerber_dir, &output_dir, &zip_path) {
-        finish_with_error(&state, &tx, &format!("ZIP: {}", e)).await;
-        return;
-    }
-
-    // Step 8: Generate viewer
-    update_status!("Generating viewer...", 90);
-    let viewer_path = output_dir.join("viewer.html");
-    if let Err(e) = viewer::generate_viewer(&board, &routed_nets, &viewer_path) {
-        finish_with_error(&state, &tx, &format!("Viewer: {}", e)).await;
-        return;
-    }
-
-    // Step 9: Generate PNG
-    update_status!("Generating PNG preview...", 95);
-    let png_path = output_dir.join("pcb-preview.png");
-    if let Err(e) = viewer::generate_png(&board, &routed_nets, &png_path) {
-        finish_with_error(&state, &tx, &format!("PNG: {}", e)).await;
-        return;
-    }
-
-    // Done!
+    // Store variants in state
     {
         let mut st = state.write().await;
-        st.routed_nets = Some(routed_nets);
+        st.variants = top3;
+        st.selected_variant = 0;
         st.build_status = BuildStatus {
             running: false,
             step: "Build complete!".into(),
@@ -512,7 +549,6 @@ pub async fn build_status(State(state): State<SharedState>) -> impl IntoResponse
 pub async fn export_toml(State(state): State<SharedState>) -> impl IntoResponse {
     let st = state.read().await;
 
-    // Read original TOML and update positions
     let original = match std::fs::read_to_string(&st.input_path) {
         Ok(s) => s,
         Err(e) => {
@@ -525,7 +561,6 @@ pub async fn export_toml(State(state): State<SharedState>) -> impl IntoResponse 
         }
     };
 
-    // Parse original to get structure
     let mut doc: toml::Value = match toml::from_str(&original) {
         Ok(v) => v,
         Err(e) => {
@@ -538,25 +573,20 @@ pub async fn export_toml(State(state): State<SharedState>) -> impl IntoResponse 
         }
     };
 
-    // Update component positions
-    if let Some(components) = doc.get_mut("components").and_then(|c| c.as_table_mut()) {
-        for comp in &st.board.components {
-            if let Some(comp_table) = components.get_mut(&comp.name).and_then(|c| c.as_table_mut())
-            {
-                comp_table.insert("x".to_string(), toml::Value::Float(comp.x));
-                comp_table.insert("y".to_string(), toml::Value::Float(comp.y));
-                if comp.rotation.abs() > 0.01 {
-                    comp_table
-                        .insert("rotation".to_string(), toml::Value::Float(comp.rotation));
-                }
-            }
-        }
-    }
+    // Update board size from selected variant
+    let active_board = if !st.variants.is_empty() {
+        let idx = st.selected_variant.min(st.variants.len() - 1);
+        &st.variants[idx].board
+    } else {
+        &st.board
+    };
 
-    // Update board size
     if let Some(board) = doc.get_mut("board").and_then(|b| b.as_table_mut()) {
-        board.insert("width".to_string(), toml::Value::Float(st.board.width));
-        board.insert("height".to_string(), toml::Value::Float(st.board.height));
+        board.insert("width".to_string(), toml::Value::Float(active_board.width));
+        board.insert(
+            "height".to_string(),
+            toml::Value::Float(active_board.height),
+        );
     }
 
     let toml_str = toml::to_string_pretty(&doc).unwrap_or_else(|_| "Error serializing".into());
@@ -575,10 +605,14 @@ pub async fn export_toml(State(state): State<SharedState>) -> impl IntoResponse 
         .into_response()
 }
 
-// GET /api/export/zip — download jlcpcb.zip
+// GET /api/export/zip — download jlcpcb.zip for selected variant
 pub async fn export_zip(State(state): State<SharedState>) -> impl IntoResponse {
     let st = state.read().await;
-    let zip_path = st.output_dir.join("jlcpcb.zip");
+    let variant_idx = st.selected_variant + 1;
+    let zip_path = st
+        .output_dir
+        .join(format!("placement-{}", variant_idx))
+        .join("jlcpcb.zip");
 
     match std::fs::read(&zip_path) {
         Ok(data) => (
@@ -603,12 +637,22 @@ pub async fn export_zip(State(state): State<SharedState>) -> impl IntoResponse {
     }
 }
 
-// GET /api/viewer — return SVG of current PCB
+// GET /api/viewer — return SVG of current selected variant
 pub async fn get_viewer_svg(State(state): State<SharedState>) -> impl IntoResponse {
     let st = state.read().await;
-    let empty = vec![];
-    let routed = st.routed_nets.as_deref().unwrap_or(&empty);
-    let svg = viewer::render_standalone_svg(&st.board, routed);
 
+    let (board_ref, routed_ref);
+    let empty = vec![];
+
+    if !st.variants.is_empty() {
+        let idx = st.selected_variant.min(st.variants.len() - 1);
+        board_ref = &st.variants[idx].board;
+        routed_ref = &st.variants[idx].routed_nets;
+    } else {
+        board_ref = &st.board;
+        routed_ref = &empty;
+    };
+
+    let svg = viewer::render_standalone_svg(board_ref, routed_ref);
     (StatusCode::OK, [(header::CONTENT_TYPE, "image/svg+xml")], svg)
 }

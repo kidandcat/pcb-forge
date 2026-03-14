@@ -514,7 +514,6 @@ mod tests {
                     x: 10.0,
                     y: 10.0,
                     rotation: 0.0,
-                    manually_placed: false,
                 },
                 Component {
                     ref_des: "R1".to_string(),
@@ -535,7 +534,6 @@ mod tests {
                     x: 20.0,
                     y: 10.0,
                     rotation: 0.0,
-                    manually_placed: false,
                 },
             ],
             nets: vec![

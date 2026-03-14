@@ -12,13 +12,8 @@ clearance = 0.2     # mm
 # Components
 # ──────────────────────────────────────
 #
-# Manual placement is supported per component:
-#   x = 40.0        # X position in mm
-#   y = 30.0        # Y position in mm
-#   rotation = 90.0 # Rotation in degrees (optional)
-#
-# If x/y are omitted, automatic placement is used.
-# Board width/height are also optional — omit them to auto-calculate.
+# All components are placed automatically using connectivity-aware algorithms.
+# Board width/height are optional — omit them to auto-calculate.
 
 [components.esp32]
 footprint = "RF_Module.pretty/ESP32-S3-WROOM-1.kicad_mod"

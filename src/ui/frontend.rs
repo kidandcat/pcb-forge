@@ -309,6 +309,32 @@ body {
 }
 #status-bar .status-text { color: var(--text-dim); }
 #status-bar .hover-info { color: var(--accent); flex: 1; }
+
+/* ─── Variant tabs ─── */
+.variant-tab {
+  flex: 1;
+  padding: 8px 4px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-input);
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: center;
+  transition: all 0.15s;
+}
+.variant-tab:hover { border-color: var(--border-hover); color: var(--text); }
+.variant-tab.active { border-color: var(--accent); color: var(--accent); background: rgba(233,69,96,0.1); }
+.variant-score-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 2px 0;
+  font-size: 10px;
+}
+.variant-score-row .label { color: var(--text-dim); }
+.variant-score-row .value { color: var(--text-bright); font-weight: 500; }
 </style>
 </head>
 <body>
@@ -380,6 +406,12 @@ body {
       <div class="error-list" id="error-list"></div>
     </div>
 
+    <div class="info-section" id="variants-section" style="display:none">
+      <h3>Placement Variants</h3>
+      <div id="variant-tabs" style="display:flex;gap:4px;margin-bottom:8px;"></div>
+      <div id="variant-scores"></div>
+    </div>
+
     <div class="info-section">
       <h3>Actions</h3>
       <button class="btn btn-build" id="btn-build" onclick="triggerBuild()">BUILD</button>
@@ -404,6 +436,8 @@ body {
 let boardData = null;
 let routedNets = null;
 let selectedRef = null;
+let variants = [];
+let selectedVariant = 0;
 let viewBox = { x: 0, y: 0, w: 100, h: 100 };
 let isPanning = false;
 let panStart = { x: 0, y: 0 };
@@ -425,10 +459,58 @@ async function loadBoard() {
     const data = await resp.json();
     boardData = data.board;
     routedNets = data.routed_nets;
+    variants = data.variants || [];
+    selectedVariant = data.selected_variant || 0;
     renderAll();
+    renderVariants();
   } catch (e) {
     console.error('Failed to load board:', e);
     document.getElementById('hover-info').textContent = 'Error loading board data';
+  }
+}
+
+function renderVariants() {
+  const section = document.getElementById('variants-section');
+  const tabs = document.getElementById('variant-tabs');
+  const scores = document.getElementById('variant-scores');
+
+  if (!variants || variants.length === 0) {
+    section.style.display = 'none';
+    return;
+  }
+
+  section.style.display = 'block';
+  tabs.innerHTML = '';
+  scores.innerHTML = '';
+
+  variants.forEach((v, i) => {
+    const btn = document.createElement('button');
+    btn.className = 'variant-tab' + (i === selectedVariant ? ' active' : '');
+    btn.textContent = '#' + (i + 1);
+    btn.title = `Score: ${v.score.composite.toFixed(0)}`;
+    btn.onclick = () => selectVariant(i);
+    tabs.appendChild(btn);
+  });
+
+  // Show score details for selected variant
+  const v = variants[selectedVariant];
+  if (v) {
+    scores.innerHTML = `
+      <div class="variant-score-row"><span class="label">Nets routed</span><span class="value">${v.score.nets_routed}/${v.score.total_nets}</span></div>
+      <div class="variant-score-row"><span class="label">Trace length</span><span class="value">${v.score.total_trace_length.toFixed(1)}mm</span></div>
+      <div class="variant-score-row"><span class="label">Vias</span><span class="value">${v.score.via_count}</span></div>
+      <div class="variant-score-row"><span class="label">Score</span><span class="value" style="color:var(--accent)">${v.score.composite.toFixed(0)}</span></div>
+    `;
+  }
+}
+
+async function selectVariant(idx) {
+  selectedVariant = idx;
+  try {
+    await fetch('/api/variant/' + idx + '/select', { method: 'POST' });
+    await loadBoard();
+  } catch (e) {
+    console.error('Failed to select variant:', e);
   }
 }
 

@@ -4,15 +4,28 @@ use std::sync::Arc;
 use anyhow::Result;
 use tokio::sync::RwLock;
 
+use crate::pcb::PlacementScore;
 use crate::router::RoutedNet;
 use crate::schema::Board;
 
 use super::api;
 
+/// A single placement variant with its routed traces and score.
+#[derive(Clone)]
+pub struct PlacementVariant {
+    pub board: Board,
+    pub routed_nets: Vec<RoutedNet>,
+    pub score: PlacementScore,
+}
+
 /// Shared application state accessible from all handlers.
 pub struct AppState {
+    /// The original (unplaced) board template.
     pub board: Board,
-    pub routed_nets: Option<Vec<RoutedNet>>,
+    /// Top 3 placement variants after build (best first).
+    pub variants: Vec<PlacementVariant>,
+    /// Currently selected variant index (0-2).
+    pub selected_variant: usize,
     pub input_path: PathBuf,
     pub output_dir: PathBuf,
     pub use_topola: bool,
@@ -52,7 +65,8 @@ pub async fn start_server(
 ) -> Result<()> {
     let state: SharedState = Arc::new(RwLock::new(AppState {
         board,
-        routed_nets: None,
+        variants: Vec::new(),
+        selected_variant: 0,
         input_path,
         output_dir,
         use_topola,
@@ -70,6 +84,14 @@ pub async fn start_server(
         .route("/api/board/size", axum::routing::put(api::update_board_size))
         .route("/api/build", axum::routing::post(api::trigger_build))
         .route("/api/build/status", axum::routing::get(api::build_status))
+        .route(
+            "/api/variant/{index}",
+            axum::routing::get(api::get_variant),
+        )
+        .route(
+            "/api/variant/{index}/select",
+            axum::routing::post(api::select_variant),
+        )
         .route("/api/export/toml", axum::routing::get(api::export_toml))
         .route("/api/export/zip", axum::routing::get(api::export_zip))
         .route("/api/viewer", axum::routing::get(api::get_viewer_svg))
