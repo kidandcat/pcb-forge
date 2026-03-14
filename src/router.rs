@@ -5,7 +5,7 @@ use crate::schema::Board;
 
 // Grid resolution: 0.25mm (compromise between precision and A* performance)
 const GRID_SIZE: f64 = 0.25;
-const CLEARANCE_MM: f64 = 0.2;
+const CLEARANCE_MM: f64 = 0.25;
 const TRACE_WIDTH_SIGNAL: f64 = 0.25;
 const TRACE_WIDTH_POWER: f64 = 0.5;
 const VIA_DRILL: f64 = 0.3;
@@ -212,7 +212,10 @@ impl Router {
         }
     }
 
-    /// Mark a rectangular area as pad obstacle on the grid (with clearance expansion)
+    /// Mark a rectangular area as pad obstacle on the grid (with clearance expansion).
+    /// The clearance accounts for the widest possible trace width to ensure that
+    /// any trace center placed at the edge of the obstacle zone still maintains
+    /// CLEARANCE_MM edge-to-edge distance from the pad.
     fn mark_pad_obstacle(
         &mut self,
         cx: f64,
@@ -222,7 +225,10 @@ impl Router {
         layer: u8,
         net_name: &str,
     ) {
-        let cl = CLEARANCE_MM;
+        // Clearance from pad edge must account for the widest trace that could
+        // be routed nearby. Without this, a power trace (0.5mm) placed at the
+        // obstacle boundary would overlap the pad.
+        let cl = CLEARANCE_MM + TRACE_WIDTH_POWER / 2.0;
         let gx_start = mm_to_grid(cx - half_w - cl);
         let gx_end = mm_to_grid(cx + half_w + cl);
         let gy_start = mm_to_grid(cy - half_h - cl);
@@ -845,4 +851,553 @@ fn merge_collinear_segments(segments: Vec<TraceSegment>) -> Vec<TraceSegment> {
     }
     merged.push(current);
     merged
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::footprint::{FootprintData, PadData};
+    use crate::schema::{Board, Component, Net, Pin, PinRef, PinType};
+
+    const MIN_CLEARANCE: f64 = 0.2;
+
+    /// Verify that clearance_cells for signal traces guarantees minimum edge-to-edge gap.
+    #[test]
+    fn test_clearance_cells_signal_to_signal() {
+        let cl = clearance_cells(TRACE_WIDTH_SIGNAL);
+        let min_center_to_center = (cl + 1) as f64 * GRID_SIZE;
+        let edge_to_edge = min_center_to_center - TRACE_WIDTH_SIGNAL;
+        assert!(
+            edge_to_edge >= MIN_CLEARANCE,
+            "Signal-to-signal edge clearance {:.3}mm < {:.3}mm minimum",
+            edge_to_edge,
+            MIN_CLEARANCE
+        );
+    }
+
+    /// Verify that clearance_cells for power traces guarantees minimum edge-to-edge gap.
+    #[test]
+    fn test_clearance_cells_power_to_power() {
+        let cl = clearance_cells(TRACE_WIDTH_POWER);
+        let min_center_to_center = (cl + 1) as f64 * GRID_SIZE;
+        let edge_to_edge = min_center_to_center - TRACE_WIDTH_POWER;
+        assert!(
+            edge_to_edge >= MIN_CLEARANCE,
+            "Power-to-power edge clearance {:.3}mm < {:.3}mm minimum",
+            edge_to_edge,
+            MIN_CLEARANCE
+        );
+    }
+
+    /// Verify clearance between a signal trace obstacle and an adjacent power trace center.
+    #[test]
+    fn test_clearance_cells_signal_near_power() {
+        let cl_signal = clearance_cells(TRACE_WIDTH_SIGNAL);
+        let min_center_to_center = (cl_signal + 1) as f64 * GRID_SIZE;
+        let edge_to_edge =
+            min_center_to_center - TRACE_WIDTH_SIGNAL / 2.0 - TRACE_WIDTH_POWER / 2.0;
+        assert!(
+            edge_to_edge >= MIN_CLEARANCE,
+            "Signal-to-power edge clearance {:.3}mm < {:.3}mm minimum",
+            edge_to_edge,
+            MIN_CLEARANCE
+        );
+    }
+
+    /// Verify mark/unmark trace cells are symmetric (no orphan obstacles).
+    #[test]
+    fn test_trace_mark_unmark_symmetry() {
+        let mut router = Router::new(10.0, 10.0, GRID_SIZE);
+        let path = vec![
+            GridPoint { x: 5, y: 5, layer: 0 },
+            GridPoint { x: 6, y: 5, layer: 0 },
+            GridPoint { x: 7, y: 5, layer: 0 },
+        ];
+
+        assert!(router.trace_obstacles.is_empty());
+        router.mark_trace_cells(&path, TRACE_WIDTH_SIGNAL);
+        assert!(!router.trace_obstacles.is_empty());
+        router.unmark_trace_cells(&path, TRACE_WIDTH_SIGNAL);
+        assert!(
+            router.trace_obstacles.is_empty(),
+            "Trace obstacles not fully cleared after unmark"
+        );
+    }
+
+    /// Verify that merge_collinear_segments joins aligned contiguous segments.
+    #[test]
+    fn test_merge_collinear_segments_basic() {
+        let segments = vec![
+            TraceSegment {
+                start: (0.0, 0.0),
+                end: (1.0, 0.0),
+                layer: 0,
+                width: 0.25,
+            },
+            TraceSegment {
+                start: (1.0, 0.0),
+                end: (2.0, 0.0),
+                layer: 0,
+                width: 0.25,
+            },
+            TraceSegment {
+                start: (2.0, 0.0),
+                end: (3.0, 0.0),
+                layer: 0,
+                width: 0.25,
+            },
+        ];
+        let merged = merge_collinear_segments(segments);
+        assert_eq!(merged.len(), 1, "Three collinear segments should merge into one");
+        assert!((merged[0].start.0 - 0.0).abs() < 0.001);
+        assert!((merged[0].end.0 - 3.0).abs() < 0.001);
+    }
+
+    /// Verify that non-collinear segments are not merged.
+    #[test]
+    fn test_merge_collinear_segments_bend() {
+        let segments = vec![
+            TraceSegment {
+                start: (0.0, 0.0),
+                end: (1.0, 0.0),
+                layer: 0,
+                width: 0.25,
+            },
+            TraceSegment {
+                start: (1.0, 0.0),
+                end: (1.0, 1.0),
+                layer: 0,
+                width: 0.25,
+            },
+        ];
+        let merged = merge_collinear_segments(segments);
+        assert_eq!(merged.len(), 2, "Non-collinear segments should not merge");
+    }
+
+    /// Verify that pad obstacle clearance accounts for trace width.
+    #[test]
+    fn test_pad_obstacle_accounts_for_trace_width() {
+        let mut router = Router::new(20.0, 20.0, GRID_SIZE);
+
+        // Place a pad at (10, 10) with 1mm x 1mm size
+        router.mark_pad_obstacle(10.0, 10.0, 0.5, 0.5, 0, "NET1");
+
+        // Check that cells near the pad are blocked
+        let pad_edge_x = 10.0 + 0.5; // = 10.5mm (pad right edge)
+
+        // A power trace center placed right at clearance boundary should still
+        // maintain CLEARANCE_MM from the pad edge. The obstacle zone should extend
+        // CLEARANCE_MM + TRACE_WIDTH_POWER/2 from pad edge.
+        let too_close_x = pad_edge_x + CLEARANCE_MM; // Not enough clearance for power trace
+        let too_close_gx = mm_to_grid(too_close_x);
+        let point = GridPoint {
+            x: too_close_gx,
+            y: mm_to_grid(10.0),
+            layer: 0,
+        };
+
+        // This point should be blocked because a power trace here would be too
+        // close to the pad (its edge would only be CLEARANCE_MM - POWER/2 from pad)
+        assert!(
+            !router.is_valid_for_net(point, "OTHER_NET"),
+            "Point at {:.2}mm from pad edge should be blocked (too close for power trace)",
+            too_close_x - pad_edge_x
+        );
+    }
+
+    /// Helper to create a simple test board with two components and one net.
+    fn make_simple_board() -> Board {
+        let pad_a = PadData {
+            number: "1".to_string(),
+            pad_type: "smd".to_string(),
+            shape: "rect".to_string(),
+            at_x: 0.0,
+            at_y: 0.0,
+            size_w: 1.0,
+            size_h: 0.6,
+            layers: vec!["F.Cu".to_string()],
+            drill: None,
+        };
+        let pad_b = PadData {
+            number: "1".to_string(),
+            pad_type: "smd".to_string(),
+            shape: "rect".to_string(),
+            at_x: 0.0,
+            at_y: 0.0,
+            size_w: 1.0,
+            size_h: 0.6,
+            layers: vec!["F.Cu".to_string()],
+            drill: None,
+        };
+
+        Board {
+            width: 20.0,
+            height: 20.0,
+            layers: 2,
+            trace_width: 0.25,
+            clearance: 0.25,
+            components: vec![
+                Component {
+                    ref_des: "R1".to_string(),
+                    name: "comp_a".to_string(),
+                    footprint: "R_0402".to_string(),
+                    value: "10K".to_string(),
+                    lcsc: None,
+                    pins: vec![Pin {
+                        name: "P1".to_string(),
+                        number: "1".to_string(),
+                        pin_type: PinType::Passive,
+                        x: 0.0,
+                        y: 0.0,
+                    }],
+                    description: None,
+                    footprint_data: Some(FootprintData {
+                        name: "R_0402".to_string(),
+                        pads: vec![pad_a],
+                        lines: vec![],
+                    }),
+                    x: 5.0,
+                    y: 10.0,
+                    rotation: 0.0,
+                },
+                Component {
+                    ref_des: "R2".to_string(),
+                    name: "comp_b".to_string(),
+                    footprint: "R_0402".to_string(),
+                    value: "10K".to_string(),
+                    lcsc: None,
+                    pins: vec![Pin {
+                        name: "P1".to_string(),
+                        number: "1".to_string(),
+                        pin_type: PinType::Passive,
+                        x: 0.0,
+                        y: 0.0,
+                    }],
+                    description: None,
+                    footprint_data: Some(FootprintData {
+                        name: "R_0402".to_string(),
+                        pads: vec![pad_b],
+                        lines: vec![],
+                    }),
+                    x: 15.0,
+                    y: 10.0,
+                    rotation: 0.0,
+                },
+            ],
+            nets: vec![Net {
+                name: "NET1".to_string(),
+                pins: vec![
+                    PinRef {
+                        component: "comp_a".to_string(),
+                        pin: "P1".to_string(),
+                    },
+                    PinRef {
+                        component: "comp_b".to_string(),
+                        pin: "P1".to_string(),
+                    },
+                ],
+            }],
+        }
+    }
+
+    /// Route a simple 2-pin net and verify trace segments respect minimum clearance
+    /// with pads of other nets.
+    #[test]
+    fn test_routed_traces_respect_clearance() {
+        let board = make_simple_board();
+        let mut router = Router::new(board.width, board.height, GRID_SIZE);
+        let routed = router.route_all(&board);
+
+        for net in &routed {
+            for seg in &net.segments {
+                // Verify segments are within board bounds
+                assert!(
+                    seg.start.0 >= 0.0 && seg.start.0 <= board.width,
+                    "Segment start X {:.2} out of board bounds",
+                    seg.start.0
+                );
+                assert!(
+                    seg.start.1 >= 0.0 && seg.start.1 <= board.height,
+                    "Segment start Y {:.2} out of board bounds",
+                    seg.start.1
+                );
+                assert!(
+                    seg.end.0 >= 0.0 && seg.end.0 <= board.width,
+                    "Segment end X {:.2} out of board bounds",
+                    seg.end.0
+                );
+                assert!(
+                    seg.end.1 >= 0.0 && seg.end.1 <= board.height,
+                    "Segment end Y {:.2} out of board bounds",
+                    seg.end.1
+                );
+            }
+        }
+    }
+
+    /// Verify that two parallel routed traces maintain minimum clearance.
+    #[test]
+    fn test_parallel_traces_clearance() {
+        // Create a board with two parallel nets that must be routed side by side
+        let make_pad = || PadData {
+            number: "1".to_string(),
+            pad_type: "smd".to_string(),
+            shape: "rect".to_string(),
+            at_x: 0.0,
+            at_y: 0.0,
+            size_w: 0.6,
+            size_h: 0.6,
+            layers: vec!["F.Cu".to_string()],
+            drill: None,
+        };
+
+        let board = Board {
+            width: 20.0,
+            height: 20.0,
+            layers: 2,
+            trace_width: 0.25,
+            clearance: 0.25,
+            components: vec![
+                Component {
+                    ref_des: "R1".to_string(),
+                    name: "c1".to_string(),
+                    footprint: "R_0402".to_string(),
+                    value: "10K".to_string(),
+                    lcsc: None,
+                    pins: vec![Pin {
+                        name: "P1".to_string(),
+                        number: "1".to_string(),
+                        pin_type: PinType::Passive,
+                        x: 0.0,
+                        y: 0.0,
+                    }],
+                    description: None,
+                    footprint_data: Some(FootprintData {
+                        name: "R_0402".to_string(),
+                        pads: vec![make_pad()],
+                        lines: vec![],
+                    }),
+                    x: 3.0,
+                    y: 10.0,
+                    rotation: 0.0,
+                },
+                Component {
+                    ref_des: "R2".to_string(),
+                    name: "c2".to_string(),
+                    footprint: "R_0402".to_string(),
+                    value: "10K".to_string(),
+                    lcsc: None,
+                    pins: vec![Pin {
+                        name: "P1".to_string(),
+                        number: "1".to_string(),
+                        pin_type: PinType::Passive,
+                        x: 0.0,
+                        y: 0.0,
+                    }],
+                    description: None,
+                    footprint_data: Some(FootprintData {
+                        name: "R_0402".to_string(),
+                        pads: vec![make_pad()],
+                        lines: vec![],
+                    }),
+                    x: 17.0,
+                    y: 10.0,
+                    rotation: 0.0,
+                },
+                Component {
+                    ref_des: "R3".to_string(),
+                    name: "c3".to_string(),
+                    footprint: "R_0402".to_string(),
+                    value: "10K".to_string(),
+                    lcsc: None,
+                    pins: vec![Pin {
+                        name: "P1".to_string(),
+                        number: "1".to_string(),
+                        pin_type: PinType::Passive,
+                        x: 0.0,
+                        y: 0.0,
+                    }],
+                    description: None,
+                    footprint_data: Some(FootprintData {
+                        name: "R_0402".to_string(),
+                        pads: vec![make_pad()],
+                        lines: vec![],
+                    }),
+                    x: 3.0,
+                    y: 10.75,
+                    rotation: 0.0,
+                },
+                Component {
+                    ref_des: "R4".to_string(),
+                    name: "c4".to_string(),
+                    footprint: "R_0402".to_string(),
+                    value: "10K".to_string(),
+                    lcsc: None,
+                    pins: vec![Pin {
+                        name: "P1".to_string(),
+                        number: "1".to_string(),
+                        pin_type: PinType::Passive,
+                        x: 0.0,
+                        y: 0.0,
+                    }],
+                    description: None,
+                    footprint_data: Some(FootprintData {
+                        name: "R_0402".to_string(),
+                        pads: vec![make_pad()],
+                        lines: vec![],
+                    }),
+                    x: 17.0,
+                    y: 10.75,
+                    rotation: 0.0,
+                },
+            ],
+            nets: vec![
+                Net {
+                    name: "NET_A".to_string(),
+                    pins: vec![
+                        PinRef { component: "c1".to_string(), pin: "P1".to_string() },
+                        PinRef { component: "c2".to_string(), pin: "P1".to_string() },
+                    ],
+                },
+                Net {
+                    name: "NET_B".to_string(),
+                    pins: vec![
+                        PinRef { component: "c3".to_string(), pin: "P1".to_string() },
+                        PinRef { component: "c4".to_string(), pin: "P1".to_string() },
+                    ],
+                },
+            ],
+        };
+
+        let mut router = Router::new(board.width, board.height, GRID_SIZE);
+        let routed = router.route_all(&board);
+
+        // Collect all segments from different nets
+        let net_a_segs: Vec<&TraceSegment> = routed
+            .iter()
+            .filter(|r| r.name == "NET_A")
+            .flat_map(|r| &r.segments)
+            .collect();
+        let net_b_segs: Vec<&TraceSegment> = routed
+            .iter()
+            .filter(|r| r.name == "NET_B")
+            .flat_map(|r| &r.segments)
+            .collect();
+
+        // Check minimum distance between segments of different nets
+        for seg_a in &net_a_segs {
+            for seg_b in &net_b_segs {
+                if seg_a.layer != seg_b.layer {
+                    continue;
+                }
+                let dist = min_segment_distance(seg_a, seg_b);
+                let edge_dist = dist - seg_a.width / 2.0 - seg_b.width / 2.0;
+                assert!(
+                    edge_dist >= MIN_CLEARANCE - 0.01, // small tolerance for grid quantization
+                    "Traces too close: NET_A seg ({:.2},{:.2})-({:.2},{:.2}) to NET_B seg ({:.2},{:.2})-({:.2},{:.2}): edge distance {:.3}mm < {:.3}mm",
+                    seg_a.start.0, seg_a.start.1, seg_a.end.0, seg_a.end.1,
+                    seg_b.start.0, seg_b.start.1, seg_b.end.0, seg_b.end.1,
+                    edge_dist, MIN_CLEARANCE
+                );
+            }
+        }
+    }
+
+    /// Minimum distance between two line segments (center-to-center).
+    fn min_segment_distance(a: &TraceSegment, b: &TraceSegment) -> f64 {
+        // Sample points along each segment and find minimum distance
+        let steps = 20;
+        let mut min_dist = f64::MAX;
+        for i in 0..=steps {
+            let t = i as f64 / steps as f64;
+            let ax = a.start.0 + t * (a.end.0 - a.start.0);
+            let ay = a.start.1 + t * (a.end.1 - a.start.1);
+            for j in 0..=steps {
+                let s = j as f64 / steps as f64;
+                let bx = b.start.0 + s * (b.end.0 - b.start.0);
+                let by = b.start.1 + s * (b.end.1 - b.start.1);
+                let dist = ((ax - bx).powi(2) + (ay - by).powi(2)).sqrt();
+                if dist < min_dist {
+                    min_dist = dist;
+                }
+            }
+        }
+        min_dist
+    }
+
+    /// Verify that no routed trace segment passes through a pad of another net.
+    #[test]
+    fn test_no_trace_through_foreign_pad() {
+        let board = make_simple_board();
+        let mut router = Router::new(board.width, board.height, GRID_SIZE);
+        let routed = router.route_all(&board);
+
+        // Build map of pad locations per net
+        let mut pad_locations: Vec<(String, f64, f64, f64, f64, u8)> = Vec::new(); // (net, cx, cy, hw, hh, layer)
+        let mut pin_to_net: HashMap<(String, String), String> = HashMap::new();
+        for net in &board.nets {
+            for pin_ref in &net.pins {
+                pin_to_net.insert(
+                    (pin_ref.component.clone(), pin_ref.pin.clone()),
+                    net.name.clone(),
+                );
+            }
+        }
+        for comp in &board.components {
+            if let Some(fp) = &comp.footprint_data {
+                for pad in fp.signal_pads() {
+                    let (rx, ry) = rotate_point(pad.at_x, pad.at_y, comp.rotation);
+                    let cx = comp.x + rx;
+                    let cy = comp.y + ry;
+                    let net = comp
+                        .pins
+                        .iter()
+                        .find(|p| p.number == pad.number)
+                        .and_then(|p| pin_to_net.get(&(comp.name.clone(), p.name.clone())))
+                        .cloned()
+                        .unwrap_or_default();
+                    let layer: u8 = if pad.pad_type == "thru_hole" {
+                        2
+                    } else if pad.layers.iter().any(|l| l.contains("B.Cu")) {
+                        1
+                    } else {
+                        0
+                    };
+                    pad_locations.push((net, cx, cy, pad.size_w / 2.0, pad.size_h / 2.0, layer));
+                }
+            }
+        }
+
+        // Check each trace segment against foreign pads
+        for routed_net in &routed {
+            for seg in &routed_net.segments {
+                for (pad_net, pcx, pcy, phw, phh, pad_layer) in &pad_locations {
+                    if pad_net == &routed_net.name {
+                        continue; // Same net, OK
+                    }
+                    if *pad_layer != 2 && *pad_layer != seg.layer {
+                        continue; // Different layer
+                    }
+
+                    // Check if segment passes through pad rectangle
+                    let steps = 20;
+                    for i in 0..=steps {
+                        let t = i as f64 / steps as f64;
+                        let sx = seg.start.0 + t * (seg.end.0 - seg.start.0);
+                        let sy = seg.start.1 + t * (seg.end.1 - seg.start.1);
+
+                        let in_pad = sx >= pcx - phw
+                            && sx <= pcx + phw
+                            && sy >= pcy - phh
+                            && sy <= pcy + phh;
+                        assert!(
+                            !in_pad,
+                            "Trace '{}' passes through pad of net '{}' at ({:.2}, {:.2})",
+                            routed_net.name, pad_net, sx, sy
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

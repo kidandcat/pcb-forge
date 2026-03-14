@@ -379,7 +379,7 @@ fn extract_traces(
             }
             PrimitiveIndex::LooseBend(_) => {
                 if let PrimitiveShape::Bend(bend) = primitive.shape() {
-                    let points: Vec<_> = bend.render_discretization(21).collect();
+                    let points: Vec<_> = bend.render_discretization(64).collect();
                     for window in points.windows(2) {
                         entry.1.push(TraceSegment {
                             start: (window[0].x() * UM_TO_MM, window[0].y() * UM_TO_MM),
@@ -407,6 +407,33 @@ fn extract_traces(
             _ => {}
         }
     }
+
+    // Diagnostic logging
+    let mut total_segs = 0usize;
+    let mut total_bends = 0usize;
+    let mut total_vias = 0usize;
+    for (_, (name, segments, vias)) in &net_traces {
+        let bend_count = segments.iter().filter(|s| {
+            // Bend-derived segments are non-axis-aligned (diagonal)
+            let dx = (s.end.0 - s.start.0).abs();
+            let dy = (s.end.1 - s.start.1).abs();
+            dx > 0.001 && dy > 0.001
+        }).count();
+        let seg_count = segments.len() - bend_count;
+        total_segs += seg_count;
+        total_bends += bend_count;
+        total_vias += vias.len();
+        if !segments.is_empty() || !vias.is_empty() {
+            eprintln!(
+                "  Topola net '{}': {} straight segs, {} bend segs, {} vias",
+                name, seg_count, bend_count, vias.len()
+            );
+        }
+    }
+    eprintln!(
+        "  Topola totals: {} straight segs, {} bend segs, {} vias",
+        total_segs, total_bends, total_vias
+    );
 
     // Build output matching pcb-forge net order.
     // Power pour nets (GND, VCC3V3) are included in DSN for obstacle handling but
@@ -439,4 +466,244 @@ fn extract_traces(
     }
 
     routed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::footprint::{FootprintData, PadData};
+    use crate::schema::{Board, Component, Net, Pin, PinRef, PinType};
+
+    /// Create a minimal board for DSN testing.
+    fn make_test_board() -> Board {
+        let make_pad = |num: &str, x: f64, y: f64| PadData {
+            number: num.to_string(),
+            pad_type: "smd".to_string(),
+            shape: "rect".to_string(),
+            at_x: x,
+            at_y: y,
+            size_w: 0.8,
+            size_h: 0.5,
+            layers: vec!["F.Cu".to_string()],
+            drill: None,
+        };
+
+        Board {
+            width: 30.0,
+            height: 20.0,
+            layers: 2,
+            trace_width: 0.25,
+            clearance: 0.25,
+            components: vec![
+                Component {
+                    ref_des: "U1".to_string(),
+                    name: "chip".to_string(),
+                    footprint: "Package_SO:SOIC-8".to_string(),
+                    value: "IC1".to_string(),
+                    lcsc: None,
+                    pins: vec![
+                        Pin { name: "A".to_string(), number: "1".to_string(), pin_type: PinType::Passive, x: -1.27, y: -0.635 },
+                        Pin { name: "B".to_string(), number: "2".to_string(), pin_type: PinType::Passive, x: -1.27, y: 0.635 },
+                    ],
+                    description: None,
+                    footprint_data: Some(FootprintData {
+                        name: "SOIC-8".to_string(),
+                        pads: vec![make_pad("1", -1.27, -0.635), make_pad("2", -1.27, 0.635)],
+                        lines: vec![],
+                    }),
+                    x: 10.0,
+                    y: 10.0,
+                    rotation: 0.0,
+                },
+                Component {
+                    ref_des: "R1".to_string(),
+                    name: "res".to_string(),
+                    footprint: "Resistor_SMD:R_0402".to_string(),
+                    value: "10K".to_string(),
+                    lcsc: None,
+                    pins: vec![
+                        Pin { name: "P1".to_string(), number: "1".to_string(), pin_type: PinType::Passive, x: -0.5, y: 0.0 },
+                        Pin { name: "P2".to_string(), number: "2".to_string(), pin_type: PinType::Passive, x: 0.5, y: 0.0 },
+                    ],
+                    description: None,
+                    footprint_data: Some(FootprintData {
+                        name: "R_0402".to_string(),
+                        pads: vec![make_pad("1", -0.5, 0.0), make_pad("2", 0.5, 0.0)],
+                        lines: vec![],
+                    }),
+                    x: 20.0,
+                    y: 10.0,
+                    rotation: 0.0,
+                },
+            ],
+            nets: vec![
+                Net {
+                    name: "SIG1".to_string(),
+                    pins: vec![
+                        PinRef { component: "chip".to_string(), pin: "A".to_string() },
+                        PinRef { component: "res".to_string(), pin: "P1".to_string() },
+                    ],
+                },
+            ],
+        }
+    }
+
+    /// Verify that generated DSN contains all required sections.
+    #[test]
+    fn test_dsn_structure() {
+        let board = make_test_board();
+        let dsn = generate_dsn(&board);
+
+        assert!(dsn.contains("(pcb pcb_forge"), "Missing PCB header");
+        assert!(dsn.contains("(parser"), "Missing parser section");
+        assert!(dsn.contains("(resolution um 10)"), "Missing resolution");
+        assert!(dsn.contains("(structure"), "Missing structure section");
+        assert!(dsn.contains("(layer F.Cu"), "Missing F.Cu layer");
+        assert!(dsn.contains("(layer B.Cu"), "Missing B.Cu layer");
+        assert!(dsn.contains("(boundary"), "Missing boundary");
+        assert!(dsn.contains("(placement"), "Missing placement");
+        assert!(dsn.contains("(library"), "Missing library");
+        assert!(dsn.contains("(network"), "Missing network");
+        assert!(dsn.contains("(wiring"), "Missing wiring section");
+    }
+
+    /// Verify that DSN clearance matches board clearance.
+    #[test]
+    fn test_dsn_clearance_value() {
+        let board = make_test_board();
+        let dsn = generate_dsn(&board);
+
+        let expected_clearance_um = board.clearance * MM_TO_UM;
+        let clearance_str = format!("(clearance {})", expected_clearance_um);
+        assert!(
+            dsn.contains(&clearance_str),
+            "DSN should contain clearance={}, got DSN:\n{}",
+            expected_clearance_um,
+            dsn
+        );
+    }
+
+    /// Verify that DSN trace width matches board trace_width.
+    #[test]
+    fn test_dsn_trace_width() {
+        let board = make_test_board();
+        let dsn = generate_dsn(&board);
+
+        let expected_width_um = board.trace_width * MM_TO_UM;
+        let width_str = format!("(width {})", expected_width_um);
+        assert!(
+            dsn.contains(&width_str),
+            "DSN should contain width={}",
+            expected_width_um
+        );
+    }
+
+    /// Verify that padstack names are deterministic and correctly formed.
+    #[test]
+    fn test_padstack_names() {
+        let pad = PadData {
+            number: "1".to_string(),
+            pad_type: "smd".to_string(),
+            shape: "rect".to_string(),
+            at_x: 0.0,
+            at_y: 0.0,
+            size_w: 0.8,
+            size_h: 0.5,
+            layers: vec!["F.Cu".to_string()],
+            drill: None,
+        };
+        let name = make_padstack_name(&pad);
+        assert_eq!(name, "Pad_SMD_800x500", "SMD padstack name incorrect");
+
+        let tht_pad = PadData {
+            number: "1".to_string(),
+            pad_type: "thru_hole".to_string(),
+            shape: "circle".to_string(),
+            at_x: 0.0,
+            at_y: 0.0,
+            size_w: 1.5,
+            size_h: 1.5,
+            layers: vec!["F.Cu".to_string(), "B.Cu".to_string()],
+            drill: Some(0.8),
+        };
+        let tht_name = make_padstack_name(&tht_pad);
+        assert_eq!(tht_name, "Pad_THT_1500x1500_D800", "THT padstack name incorrect");
+    }
+
+    /// Verify generated DSN can be parsed by Topola.
+    #[test]
+    fn test_dsn_parseable_by_topola() {
+        let board = make_test_board();
+        let dsn = generate_dsn(&board);
+
+        let cursor = std::io::Cursor::new(dsn.as_bytes());
+        let bufread = std::io::BufReader::new(cursor);
+        let result = SpecctraDesign::load(bufread);
+
+        assert!(
+            result.is_ok(),
+            "Generated DSN should be parseable by Topola: {:?}",
+            result.err()
+        );
+    }
+
+    /// Verify that DSN roundtrip produces a valid Topola board.
+    #[test]
+    fn test_dsn_roundtrip_creates_board() {
+        let board = make_test_board();
+        let dsn = generate_dsn(&board);
+
+        let cursor = std::io::Cursor::new(dsn.as_bytes());
+        let bufread = std::io::BufReader::new(cursor);
+        let design = SpecctraDesign::load(bufread).expect("DSN should parse");
+
+        let mut recorder = topola::board::edit::BoardEdit::new();
+        let topola_board = design.make_board(&mut recorder);
+
+        // Verify board has primitives
+        let prim_count = topola_board.layout().drawing().primitive_nodes().count();
+        assert!(
+            prim_count > 0,
+            "Topola board should have primitives after loading DSN, got {}",
+            prim_count
+        );
+    }
+
+    /// Verify that dsn_quote escapes special characters correctly.
+    #[test]
+    fn test_dsn_quote() {
+        assert_eq!(dsn_quote("simple"), "simple");
+        assert_eq!(dsn_quote("with space"), "\"with space\"");
+        assert_eq!(dsn_quote("with-dash"), "\"with-dash\"");
+        assert_eq!(dsn_quote("has(paren)"), "\"has(paren)\"");
+    }
+
+    /// Verify boundary dimensions match board size.
+    #[test]
+    fn test_dsn_boundary_dimensions() {
+        let board = make_test_board();
+        let dsn = generate_dsn(&board);
+
+        let bw = board.width * MM_TO_UM;
+        let bh = board.height * MM_TO_UM;
+        let boundary_str = format!("{} 0  {} {}  0 {}", bw, bw, bh, bh);
+        assert!(
+            dsn.contains(&boundary_str),
+            "DSN boundary should match board dimensions ({}x{} um)",
+            bw,
+            bh
+        );
+    }
+
+    /// Verify that net pins are correctly referenced in DSN.
+    #[test]
+    fn test_dsn_net_pin_references() {
+        let board = make_test_board();
+        let dsn = generate_dsn(&board);
+
+        // SIG1 connects chip.A (pin 1) and res.P1 (pin 1)
+        assert!(dsn.contains("(net SIG1"), "Missing net SIG1");
+        assert!(dsn.contains("U1-1"), "Missing pin reference U1-1 for chip.A");
+        assert!(dsn.contains("R1-1"), "Missing pin reference R1-1 for res.P1");
+    }
 }

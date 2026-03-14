@@ -35,7 +35,7 @@ fn default_trace_width() -> f64 {
     0.25
 }
 fn default_clearance() -> f64 {
-    0.2
+    0.25
 }
 
 #[derive(Debug, Clone, Deserialize)]
