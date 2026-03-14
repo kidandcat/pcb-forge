@@ -265,7 +265,7 @@ fn render_scale_bar(board: &Board) -> String {
             "<line x1=\"0\" y1=\"{y}\" x2=\"{len}\" y2=\"{y}\" class=\"scale-bar\"/>",
             "<line x1=\"0\" y1=\"{y1}\" x2=\"0\" y2=\"{y2}\" class=\"scale-bar\"/>",
             "<line x1=\"{len}\" y1=\"{y1}\" x2=\"{len}\" y2=\"{y2}\" class=\"scale-bar\"/>",
-            "<text x=\"{tx}\" y=\"{ty}\" class=\"scale-text\" text-anchor=\"middle\">10mm</text>",
+            "<text x=\"{tx}\" y=\"{ty}\" class=\"scale-text\" text-anchor=\"middle\" font-size=\"1.2\" font-family=\"sans-serif\" fill=\"#888\">10mm</text>",
         ),
         y = bar_y,
         y1 = bar_y - 0.5,
@@ -481,17 +481,31 @@ fn render_silkscreen(board: &Board, out: &mut String) {
             }
         }
 
-        // Reference designator label
-        let label_y = if let Some(ref fp) = comp.footprint_data {
-            let (_, min_y, _, _) = fp.courtyard_bounds();
-            comp.y + min_y - 0.5
+        // Reference designator label - centered on component with proportional size
+        let font_size = if let Some(ref fp) = comp.footprint_data {
+            let (min_x, min_y, max_x, max_y) = fp.courtyard_bounds();
+            let comp_w = max_x - min_x;
+            let comp_h = max_y - min_y;
+            (comp_w.min(comp_h) * 0.45).clamp(1.2, 4.0)
         } else {
-            comp.y - 2.0
+            1.5
         };
 
+        // Dark background for readability
+        let text_w = comp.ref_des.len() as f64 * font_size * 0.65;
+        let text_h = font_size * 1.3;
         out.push_str(&format!(
-            "    <text x=\"{:.3}\" y=\"{:.3}\" fill=\"white\" font-size=\"1.2\" font-family=\"sans-serif\" text-anchor=\"middle\" opacity=\"0.9\" data-info=\"{} ({})\">{}</text>\n",
-            comp.x, label_y,
+            "    <rect x=\"{:.3}\" y=\"{:.3}\" width=\"{:.3}\" height=\"{:.3}\" rx=\"{:.2}\" fill=\"rgba(0,0,0,0.75)\" />\n",
+            comp.x - text_w / 2.0, comp.y - text_h / 2.0,
+            text_w, text_h,
+            font_size * 0.15,
+        ));
+
+        // Offset y by ~0.35 * font_size for visual vertical centering (resvg compatible)
+        out.push_str(&format!(
+            "    <text x=\"{:.3}\" y=\"{:.3}\" fill=\"#ffdd00\" font-size=\"{:.2}\" font-family=\"sans-serif\" text-anchor=\"middle\" font-weight=\"bold\" data-info=\"{} ({})\">{}</text>\n",
+            comp.x, comp.y + font_size * 0.35,
+            font_size,
             comp.ref_des, comp.value,
             comp.ref_des,
         ));
@@ -548,7 +562,13 @@ fn rotate_size(w: f64, h: f64, degrees: f64) -> (f64, f64) {
 pub fn generate_png(board: &Board, routed_nets: &[RoutedNet], output_path: &Path) -> Result<()> {
     let svg_str = render_standalone_svg(board, routed_nets);
 
-    let options = resvg::usvg::Options::default();
+    // Load system fonts so text labels render correctly
+    let mut fontdb = resvg::usvg::fontdb::Database::new();
+    fontdb.load_system_fonts();
+    let options = resvg::usvg::Options {
+        fontdb: std::sync::Arc::new(fontdb),
+        ..Default::default()
+    };
     let tree = resvg::usvg::Tree::from_str(&svg_str, &options)
         .context("Failed to parse SVG for PNG rendering")?;
 

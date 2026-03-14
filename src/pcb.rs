@@ -90,7 +90,10 @@ fn is_vcc_net(name: &str) -> bool {
         || upper == "5V"
 }
 
-/// Compute component sizes for placement with minimum courtyard clearance
+/// Compute component sizes for placement with minimum courtyard clearance.
+/// Uses placement_bounds (Fab layer / pad bounds) rather than courtyard_bounds
+/// because courtyard can include antenna keep-out zones that are much larger
+/// than the physical component body.
 fn compute_placement_sizes(components: &[Component]) -> Vec<(f64, f64)> {
     components
         .iter()
@@ -219,30 +222,6 @@ pub fn generate_pcb(board: &mut Board, output: &Path) -> Result<()> {
     write_pcb_file(board, output)
 }
 
-/// Simple LCG pseudo-random number generator (deterministic, no external deps).
-struct SimpleRng {
-    state: u64,
-}
-
-impl SimpleRng {
-    fn new(seed: u64) -> Self {
-        Self { state: seed.wrapping_add(1) }
-    }
-    fn next_u64(&mut self) -> u64 {
-        self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        self.state
-    }
-    fn next_f64(&mut self) -> f64 {
-        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
-    }
-    /// Shuffle a slice in place (Fisher-Yates).
-    fn shuffle<T>(&mut self, slice: &mut [T]) {
-        for i in (1..slice.len()).rev() {
-            let j = (self.next_u64() as usize) % (i + 1);
-            slice.swap(i, j);
-        }
-    }
-}
 
 /// Determine the preferred edge for a connector based on its type.
 /// Returns (edge_side, rotation) where edge_side is 0=left, 1=right, 2=top, 3=bottom.
@@ -345,8 +324,6 @@ fn place_components_with_config(board: &mut Board, config: &PlacementConfig) {
 
     auto_size_board(board);
 
-    let mut rng = SimpleRng::new(config.seed);
-
     // 1. Build connectivity adjacency matrix
     let mut adj = vec![vec![0usize; n]; n];
     for net in &board.nets {
@@ -410,49 +387,40 @@ fn place_components_with_config(board: &mut Board, config: &PlacementConfig) {
 
     let total_conn: Vec<usize> = (0..n).map(|i| adj[i].iter().sum()).collect();
 
-    // Shuffle non-connector indices by seed to vary which component gets center priority
-    let mut ordered_non_conn = non_connector_indices.clone();
-    rng.shuffle(&mut ordered_non_conn);
+    // Find the most-connected non-connector component (deterministic)
+    let center_idx = *non_connector_indices.iter()
+        .max_by_key(|&&i| total_conn[i])
+        .unwrap();
 
-    // Among top-connected, pick based on shuffled order
-    ordered_non_conn.sort_by(|&a, &b| total_conn[b].cmp(&total_conn[a]));
-    // Pick from top 3 most connected based on seed
-    let top_pick = (config.seed as usize) % ordered_non_conn.len().min(3);
-    let center_idx = ordered_non_conn[top_pick];
-
-    let cx = board.width / 2.0 + config.center_angle.cos() * 3.0 * config.spacing_mult;
-    let cy = board.height / 2.0 + config.center_angle.sin() * 3.0 * config.spacing_mult;
+    let cx = board.width / 2.0 + config.center_angle.cos() * 2.0;
+    let cy = board.height / 2.0 + config.center_angle.sin() * 2.0;
     positions[center_idx] = Some((safe_clamp(cx, margin + 5.0, board.width - margin - 5.0),
                                    safe_clamp(cy, margin + 5.0, board.height - margin - 5.0)));
 
-    // 5. Place remaining non-connector components using connectivity-greedy with seed-varied order
+    // 5. Place remaining non-connector components using pure connectivity-greedy
     let mut remaining: Vec<usize> = non_connector_indices
         .iter()
         .copied()
         .filter(|&i| i != center_idx)
         .collect();
-    rng.shuffle(&mut remaining);
 
-    // Sort by connectivity to placed components (greedy), but with some randomization
     while !remaining.is_empty() {
-        // Score each remaining component by connectivity to placed components
-        let mut scored: Vec<(usize, usize, f64)> = remaining
-            .iter()
-            .enumerate()
-            .map(|(ri, &comp_idx)| {
-                let mut conn_score = 0usize;
-                for placed_idx in 0..n {
-                    if positions[placed_idx].is_some() {
-                        conn_score += adj[comp_idx][placed_idx];
-                    }
+        // Score each remaining component by connectivity to placed components (no randomization)
+        let mut best_ri = 0;
+        let mut best_score = 0usize;
+        for (ri, &comp_idx) in remaining.iter().enumerate() {
+            let mut conn_score = 0usize;
+            for placed_idx in 0..n {
+                if positions[placed_idx].is_some() {
+                    conn_score += adj[comp_idx][placed_idx];
                 }
-                let noise = rng.next_f64() * 0.3; // small randomization
-                (ri, conn_score, conn_score as f64 + noise)
-            })
-            .collect();
-        scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+            }
+            if conn_score > best_score || (conn_score == best_score && total_conn[comp_idx] > total_conn[remaining[best_ri]]) {
+                best_score = conn_score;
+                best_ri = ri;
+            }
+        }
 
-        let best_ri = scored[0].0;
         let comp_idx = remaining.remove(best_ri);
 
         // Find best placed neighbor
@@ -488,6 +456,61 @@ fn place_components_with_config(board: &mut Board, config: &PlacementConfig) {
     // 7. Post-placement fixes
     post_place_protection_near_connectors(board);
     post_place_decoupling_near_ics(board);
+
+    // 8. Final overlap validation - detect and fix any remaining overlaps
+    fix_remaining_overlaps(board);
+}
+
+/// Final pass: detect any remaining overlaps and fix them by moving offending components.
+fn fix_remaining_overlaps(board: &mut Board) {
+    let margin = 5.0;
+    let sizes = compute_placement_sizes(&board.components);
+    let n = board.components.len();
+
+    // Check all pairs for overlap
+    let mut has_overlap = true;
+    let mut iterations = 0;
+    while has_overlap && iterations < 20 {
+        has_overlap = false;
+        iterations += 1;
+
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let (wi, hi) = sizes[i];
+                let (wj, hj) = sizes[j];
+                let dx = (board.components[i].x - board.components[j].x).abs();
+                let dy = (board.components[i].y - board.components[j].y).abs();
+                let min_dx = (wi + wj) / 2.0;
+                let min_dy = (hi + hj) / 2.0;
+
+                if dx < min_dx && dy < min_dy {
+                    has_overlap = true;
+                    eprintln!(
+                        "⚠ Overlap detected: {} and {} (dx={:.1}, dy={:.1}, need dx>{:.1} or dy>{:.1})",
+                        board.components[i].ref_des, board.components[j].ref_des,
+                        dx, dy, min_dx, min_dy
+                    );
+
+                    // Move the smaller component (fewer pins) away
+                    let move_idx = if board.components[i].pins.len() <= board.components[j].pins.len() { i } else { j };
+                    let anchor_idx = if move_idx == i { j } else { i };
+
+                    let positions: Vec<Option<(f64, f64)>> = board.components.iter().enumerate()
+                        .map(|(k, c)| if k == move_idx { None } else { Some((c.x, c.y)) })
+                        .collect();
+
+                    let (px, py) = find_non_overlapping(
+                        board.components[anchor_idx].x,
+                        board.components[anchor_idx].y,
+                        &sizes, &positions, move_idx,
+                        margin, board.width - margin, margin, board.height - margin,
+                    );
+                    board.components[move_idx].x = px;
+                    board.components[move_idx].y = py;
+                }
+            }
+        }
+    }
 }
 
 /// Clamp that never panics: if min > max, returns midpoint.
@@ -601,10 +624,36 @@ fn find_non_overlapping(
             }
         }
     }
-    (
+    // Fallback: exhaustive grid search over entire board area
+    let grid_step = 2.0;
+    let mut best_pos = None;
+    let mut best_dist = f64::MAX;
+    let mut gy = min_y + mh / 2.0;
+    while gy <= max_y - mh / 2.0 {
+        let mut gx = min_x + mw / 2.0;
+        while gx <= max_x - mw / 2.0 {
+            let overlaps = positions.iter().enumerate().any(|(i, pos)| {
+                if i == my_idx { return false; }
+                if let Some((cx, cy)) = pos {
+                    let (cw, ch) = sizes[i];
+                    (gx - cx).abs() < (mw / 2.0 + cw / 2.0) && (gy - cy).abs() < (mh / 2.0 + ch / 2.0)
+                } else { false }
+            });
+            if !overlaps {
+                let dist = (gx - tx).powi(2) + (gy - ty).powi(2);
+                if dist < best_dist {
+                    best_dist = dist;
+                    best_pos = Some((gx, gy));
+                }
+            }
+            gx += grid_step;
+        }
+        gy += grid_step;
+    }
+    best_pos.unwrap_or((
         safe_clamp(tx, min_x + mw / 2.0, max_x - mw / 2.0),
         safe_clamp(ty, min_y + mh / 2.0, max_y - mh / 2.0),
-    )
+    ))
 }
 
 /// Find a non-overlapping position near (tx, ty) using spiral search with configurable step.
@@ -650,10 +699,36 @@ fn find_non_overlapping_with_step(
             }
         }
     }
-    (
+    // Fallback: exhaustive grid search over entire board area
+    let grid_step = 2.0;
+    let mut best_pos = None;
+    let mut best_dist = f64::MAX;
+    let mut gy = min_y + mh / 2.0;
+    while gy <= max_y - mh / 2.0 {
+        let mut gx = min_x + mw / 2.0;
+        while gx <= max_x - mw / 2.0 {
+            let overlaps = positions.iter().enumerate().any(|(i, pos)| {
+                if i == my_idx { return false; }
+                if let Some((cx, cy)) = pos {
+                    let (cw, ch) = sizes[i];
+                    (gx - cx).abs() < (mw / 2.0 + cw / 2.0) && (gy - cy).abs() < (mh / 2.0 + ch / 2.0)
+                } else { false }
+            });
+            if !overlaps {
+                let dist = (gx - tx).powi(2) + (gy - ty).powi(2);
+                if dist < best_dist {
+                    best_dist = dist;
+                    best_pos = Some((gx, gy));
+                }
+            }
+            gx += grid_step;
+        }
+        gy += grid_step;
+    }
+    best_pos.unwrap_or((
         safe_clamp(tx, min_x + mw / 2.0, max_x - mw / 2.0),
         safe_clamp(ty, min_y + mh / 2.0, max_y - mh / 2.0),
-    )
+    ))
 }
 
 /// Find position near board edge, close to (near_x, near_y).
