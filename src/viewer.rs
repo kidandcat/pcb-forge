@@ -481,15 +481,8 @@ fn render_silkscreen(board: &Board, out: &mut String) {
             }
         }
 
-        // Reference designator label - centered on component with proportional size
-        let font_size = if let Some(ref fp) = comp.footprint_data {
-            let (min_x, min_y, max_x, max_y) = fp.courtyard_bounds();
-            let comp_w = max_x - min_x;
-            let comp_h = max_y - min_y;
-            (comp_w.min(comp_h) * 0.25).clamp(0.6, 2.0)
-        } else {
-            0.8
-        };
+        // Reference designator label - fixed 0.8mm size like real PCB silkscreen
+        let font_size = 0.8;
 
         // Offset y by ~0.35 * font_size for visual vertical centering (resvg compatible)
         out.push_str(&format!(
@@ -497,7 +490,7 @@ fn render_silkscreen(board: &Board, out: &mut String) {
             comp.x, comp.y + font_size * 0.35,
             font_size,
             comp.ref_des, comp.value,
-            comp.value,
+            comp.ref_des,
         ));
     }
 }

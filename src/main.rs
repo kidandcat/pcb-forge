@@ -105,7 +105,7 @@ fn build(input: &PathBuf, output: &PathBuf, use_topola: bool, open_viewer: bool)
     println!("Building from: {}", input.display());
 
     // Step 1: Parse
-    println!("[1/7] Parsing circuit definition...");
+    println!("[1/5] Parsing circuit definition...");
     let board = parser::parse_circuit(input).context("Failed to parse circuit")?;
     println!(
         "  → {} components, {} nets",
@@ -115,127 +115,82 @@ fn build(input: &PathBuf, output: &PathBuf, use_topola: bool, open_viewer: bool)
 
     std::fs::create_dir_all(output)?;
 
-    // Step 2: Generate schematic (shared across all variants)
-    println!("[2/7] Generating schematic...");
+    // Step 2: Generate schematic
+    println!("[2/5] Generating schematic...");
     let sch_path = output.join("pcb-forge.kicad_sch");
     schematic::generate_schematic(&board, &sch_path)?;
     println!("  → {}", sch_path.display());
 
-    // Step 3: Generate placement variants
-    let num_variants = board.options.placement_variants;
-    println!("[3/7] Generating {} placement variants...", num_variants);
-    let configs = pcb::generate_placement_configs(&board.options);
-    let mut variants: Vec<(
-        pcb::PlacementConfig,
-        pcb_forge::schema::Board,
-        Vec<pcb_forge::router::RoutedNet>,
-        pcb::PlacementScore,
-    )> = Vec::new();
+    // Step 3: Generate placement (single best placement)
+    println!("[3/5] Placing components...");
+    let config = pcb::PlacementConfig {
+        seed: 42,
+        spacing_mult: board.options.spacing,
+        center_angle: 0.0,
+    };
+    let placed_board = pcb::generate_placement(&board, &config);
+    println!(
+        "  → Board: {:.1}mm x {:.1}mm",
+        placed_board.width, placed_board.height
+    );
 
-    for (i, config) in configs.iter().enumerate() {
-        let placed_board = pcb::generate_placement(&board, config);
-        print!("  variant {}/{}: placing...", i + 1, num_variants);
+    // Step 4: Route traces
+    println!("[4/5] Routing traces...");
+    let routed_nets = if use_topola {
+        println!("  Using Topola topological router");
+        topola_router::route_with_topola(&placed_board)?
+    } else {
+        println!("  Using A* grid router");
+        let mut router = Router::new(placed_board.width, placed_board.height, 0.1);
+        router.route_all(&placed_board)
+    };
 
-        // Step 4: Route each variant
-        let routed_nets = if use_topola {
-            print!(" routing (Topola)...");
-            match topola_router::route_with_topola(&placed_board) {
-                Ok(nets) => nets,
-                Err(e) => {
-                    println!(" FAILED: {}", e);
-                    continue;
-                }
-            }
-        } else {
-            print!(" routing (A*)...");
-            let mut router = Router::new(placed_board.width, placed_board.height, 0.1);
-            router.route_all(&placed_board)
-        };
+    let score = pcb::PlacementScore::compute(&routed_nets, board.nets.len(), &placed_board);
+    println!(
+        "  → Nets: {}/{}, trace length: {:.1}mm, vias: {}, score: {:.0}",
+        score.nets_routed, score.total_nets,
+        score.total_trace_length, score.via_count, score.composite
+    );
 
-        let score = pcb::PlacementScore::compute(&routed_nets, board.nets.len(), &placed_board);
-        println!(
-            " score={:.0} (nets={}/{}, length={:.1}mm, vias={})",
-            score.composite, score.nets_routed, score.total_nets,
-            score.total_trace_length, score.via_count
-        );
+    // Step 5: Generate outputs
+    println!("[5/5] Generating outputs...");
 
-        variants.push((config.clone(), placed_board, routed_nets, score));
-    }
+    // PCB file
+    let pcb_path = output.join("pcb-forge.kicad_pcb");
+    pcb::write_pcb_file(&placed_board, &pcb_path)?;
+    pcb::append_routed_traces(&pcb_path, &placed_board, &routed_nets)?;
+    println!("  → {}", pcb_path.display());
 
-    // Step 5: Sort by score and select top 3
-    println!("[4/7] Selecting top 3 placements...");
-    variants.sort_by(|a, b| b.3.composite.partial_cmp(&a.3.composite).unwrap());
-    let top3: Vec<_> = variants.into_iter().take(3).collect();
+    // Gerbers
+    let gerber_dir = output.join("gerbers");
+    gerber::generate_gerbers(&placed_board, &routed_nets, &gerber_dir)?;
+    println!("  → gerbers/");
 
-    // Print comparison table
-    println!("\n  ┌─────────────┬──────────┬──────────────┬──────┬───────────┐");
-    println!("  │ Placement   │ Nets     │ Trace length │ Vias │ Score     │");
-    println!("  ├─────────────┼──────────┼──────────────┼──────┼───────────┤");
-    for (rank, (_, _, _, score)) in top3.iter().enumerate() {
-        println!(
-            "  │ #{:<10} │ {:>3}/{:<3} │ {:>9.1}mm │ {:>4} │ {:>9.1} │",
-            rank + 1,
-            score.nets_routed,
-            score.total_nets,
-            score.total_trace_length,
-            score.via_count,
-            score.composite
-        );
-    }
-    println!("  └─────────────┴──────────┴──────────────┴──────┴───────────┘\n");
+    // BOM
+    bom::generate_bom(&placed_board, output)?;
+    println!("  → BOM.csv, PickAndPlace.csv");
 
-    // Step 6: Generate outputs for top 3
-    println!("[5/7] Generating outputs for top 3 placements...");
-    for (rank, (_, ref placed_board, ref routed_nets, _)) in top3.iter().enumerate() {
-        let variant_dir = output.join(format!("placement-{}", rank + 1));
-        std::fs::create_dir_all(&variant_dir)?;
+    // JLCPCB ZIP
+    let zip_path = output.join("jlcpcb.zip");
+    create_jlcpcb_zip(&gerber_dir, output, &zip_path)?;
+    println!("  → jlcpcb.zip");
 
-        // PCB file
-        let pcb_path = variant_dir.join("pcb-forge.kicad_pcb");
-        pcb::write_pcb_file(placed_board, &pcb_path)?;
-        pcb::append_routed_traces(&pcb_path, placed_board, routed_nets)?;
+    // Viewer
+    let viewer_path = output.join("viewer.html");
+    viewer::generate_viewer(&placed_board, &routed_nets, &viewer_path)?;
+    println!("  → viewer.html");
 
-        // Gerbers
-        let gerber_dir = variant_dir.join("gerbers");
-        gerber::generate_gerbers(placed_board, routed_nets, &gerber_dir)?;
-
-        // BOM
-        bom::generate_bom(placed_board, &variant_dir)?;
-
-        // JLCPCB ZIP
-        let zip_path = variant_dir.join("jlcpcb.zip");
-        create_jlcpcb_zip(&gerber_dir, &variant_dir, &zip_path)?;
-
-        // Viewer
-        let viewer_path = variant_dir.join("viewer.html");
-        viewer::generate_viewer(placed_board, routed_nets, &viewer_path)?;
-
-        // PNG
-        let png_path = variant_dir.join("pcb-preview.png");
-        viewer::generate_png(placed_board, routed_nets, &png_path)?;
-
-        println!("  → placement-{}: {}", rank + 1, variant_dir.display());
-    }
-
-    // Step 7: Generate shared BOM (from best placement)
-    println!("[6/7] Generating shared BOM...");
-    if let Some((_, ref best_board, _, _)) = top3.first() {
-        bom::generate_bom(best_board, output)?;
-        println!("  → BOM.csv, PickAndPlace.csv");
-    }
-
-    println!("[7/7] Done!");
+    // PNG preview
+    let png_path = output.join("pcb-preview.png");
+    viewer::generate_png(&placed_board, &routed_nets, &png_path)?;
+    println!("  → pcb-preview.png");
 
     if open_viewer {
-        if let Some((_, _, _, _)) = top3.first() {
-            let best_viewer = output.join("placement-1/viewer.html");
-            viewer::open_viewer(&best_viewer);
-            println!("  → Opened best placement in browser");
-        }
+        viewer::open_viewer(&viewer_path);
+        println!("  → Opened viewer in browser");
     }
 
     println!("\nBuild complete! Output: {}", output.display());
-    println!("  Best 3 placements in: placement-1/, placement-2/, placement-3/");
 
     Ok(())
 }
