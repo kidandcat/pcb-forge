@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::footprint::FootprintData;
@@ -77,7 +77,7 @@ fn default_pin_type() -> PinType {
     PinType::Passive
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PinType {
     Input,
@@ -120,7 +120,7 @@ pub struct PowerDef {
 }
 
 // Runtime structures after parsing
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Component {
     pub ref_des: String,
     pub name: String,
@@ -137,7 +137,7 @@ pub struct Component {
     pub manually_placed: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Pin {
     pub name: String,
     pub number: String,
@@ -146,19 +146,19 @@ pub struct Pin {
     pub y: f64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Net {
     pub name: String,
     pub pins: Vec<PinRef>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PinRef {
     pub component: String,
     pub pin: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Board {
     pub width: f64,
     pub height: f64,

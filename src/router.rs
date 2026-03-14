@@ -29,7 +29,7 @@ pub struct GridPoint {
 }
 
 /// A routed trace segment
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct TraceSegment {
     pub start: (f64, f64),
     pub end: (f64, f64),
@@ -38,7 +38,7 @@ pub struct TraceSegment {
 }
 
 /// A via between layers
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Via {
     pub x: f64,
     pub y: f64,
@@ -47,7 +47,7 @@ pub struct Via {
 }
 
 /// Result of routing a single net
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct RoutedNet {
     pub name: String,
     pub segments: Vec<TraceSegment>,

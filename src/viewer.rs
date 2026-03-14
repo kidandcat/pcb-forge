@@ -575,7 +575,7 @@ pub fn generate_png(board: &Board, routed_nets: &[RoutedNet], output_path: &Path
 }
 
 /// Render a standalone SVG document (no HTML/JS) suitable for rasterization.
-fn render_standalone_svg(board: &Board, routed_nets: &[RoutedNet]) -> String {
+pub fn render_standalone_svg(board: &Board, routed_nets: &[RoutedNet]) -> String {
     let mut svg_elements = String::new();
 
     let margin = 5.0;

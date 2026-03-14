@@ -56,6 +56,23 @@ enum Commands {
         /// Path to the circuit definition TOML file
         input: PathBuf,
     },
+    /// Launch interactive web UI
+    Ui {
+        /// Path to the circuit definition TOML file
+        input: PathBuf,
+
+        /// Output directory (default: ./output)
+        #[arg(short, long, default_value = "output")]
+        output: PathBuf,
+
+        /// Use Topola topological router instead of A* grid router
+        #[arg(long)]
+        topola: bool,
+
+        /// Port to listen on (default: 8080)
+        #[arg(short, long, default_value = "8080")]
+        port: u16,
+    },
 }
 
 fn main() -> Result<()> {
@@ -74,6 +91,12 @@ fn main() -> Result<()> {
             topola,
         } => build(&input, &output, topola, true),
         Commands::Validate { input } => validate(&input),
+        Commands::Ui {
+            input,
+            output,
+            topola,
+            port,
+        } => launch_ui(&input, &output, topola, port),
     }
 }
 
@@ -194,6 +217,31 @@ fn create_jlcpcb_zip(
     }
 
     zip.finish()?;
+    Ok(())
+}
+
+fn launch_ui(input: &PathBuf, output: &PathBuf, use_topola: bool, port: u16) -> Result<()> {
+    println!("pcb-forge v{}", env!("CARGO_PKG_VERSION"));
+    println!("Loading: {}", input.display());
+
+    let board = parser::parse_circuit(input).context("Failed to parse circuit")?;
+    println!(
+        "  → {} components, {} nets",
+        board.components.len(),
+        board.nets.len()
+    );
+
+    std::fs::create_dir_all(output)?;
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(pcb_forge::ui::start_server(
+        board,
+        input.to_path_buf(),
+        output.to_path_buf(),
+        use_topola,
+        port,
+    ))?;
+
     Ok(())
 }
 

@@ -3,14 +3,14 @@ use std::path::Path;
 
 // ── Parsed footprint data ──────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct FootprintData {
     pub name: String,
     pub pads: Vec<PadData>,
     pub lines: Vec<FpLine>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PadData {
     pub number: String,
     pub pad_type: String, // "smd", "thru_hole"
@@ -23,7 +23,7 @@ pub struct PadData {
     pub drill: Option<f64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct FpLine {
     pub start: (f64, f64),
     pub end: (f64, f64),
