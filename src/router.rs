@@ -372,6 +372,40 @@ impl Router {
             }
         }
 
+        // Step 2b: Mark silkscreen text bounding boxes as obstacles
+        // Traces must not route over component value labels
+        for comp in &board.components {
+            let font_size = if let Some(fp) = &comp.footprint_data {
+                let (min_x, min_y, max_x, max_y) = fp.courtyard_bounds();
+                let comp_w = max_x - min_x;
+                let comp_h = max_y - min_y;
+                (comp_w.min(comp_h) * 0.25).clamp(0.6, 2.0)
+            } else {
+                0.8
+            };
+            let label = &comp.value;
+            let text_width = label.len() as f64 * font_size * 0.6;
+            let text_height = font_size;
+            let half_w = text_width / 2.0;
+            let half_h = text_height / 2.0;
+            let cl = CLEARANCE_MM;
+            let gx_start = mm_to_grid(comp.x - half_w - cl);
+            let gx_end = mm_to_grid(comp.x + half_w + cl);
+            let gy_start = mm_to_grid(comp.y - half_h - cl);
+            let gy_end = mm_to_grid(comp.y + half_h + cl);
+            for gx in gx_start..=gx_end {
+                for gy in gy_start..=gy_end {
+                    for layer in 0..=1u8 {
+                        self.pad_obstacles.insert(GridPoint {
+                            x: gx,
+                            y: gy,
+                            layer,
+                        });
+                    }
+                }
+            }
+        }
+
         // Step 3: Collect nets with pin positions
         struct NetInfo {
             name: String,

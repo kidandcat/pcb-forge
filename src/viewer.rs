@@ -497,7 +497,7 @@ fn render_silkscreen(board: &Board, out: &mut String) {
             comp.x, comp.y + font_size * 0.35,
             font_size,
             comp.ref_des, comp.value,
-            comp.ref_des,
+            comp.value,
         ));
     }
 }
