@@ -4,7 +4,7 @@ use std::path::Path;
 use uuid::Uuid;
 
 use crate::router::RoutedNet;
-use crate::schema::{Board, Component, Layer};
+use crate::schema::{Board, Component, Layer, Options};
 
 // Placement constraints
 const MIN_COURTYARD_CLEARANCE: f64 = 0.5; // mm, minimum gap between component courtyards
@@ -131,7 +131,7 @@ pub struct PlacementScore {
 }
 
 impl PlacementScore {
-    pub fn compute(routed_nets: &[crate::router::RoutedNet], total_nets: usize) -> Self {
+    pub fn compute(routed_nets: &[crate::router::RoutedNet], total_nets: usize, board: &Board) -> Self {
         let nets_routed = routed_nets
             .iter()
             .filter(|rn| !rn.segments.is_empty())
@@ -146,10 +146,13 @@ impl PlacementScore {
         let via_count: usize = routed_nets.iter().map(|rn| rn.vias.len()).sum();
         let clearance_violations = 0; // TODO: implement DRC check
 
-        let composite = (nets_routed as f64) * 1000.0
-            - total_trace_length * 0.1
-            - (via_count as f64) * 50.0
-            - (clearance_violations as f64) * 10000.0;
+        let opts = &board.options;
+        let board_area = board.width * board.height;
+        let composite = (nets_routed as f64) * opts.net_reward
+            - total_trace_length * opts.trace_penalty
+            - (via_count as f64) * opts.via_penalty
+            - (clearance_violations as f64) * 10000.0
+            - board_area * opts.board_penalty;
 
         Self {
             nets_routed,
@@ -162,17 +165,23 @@ impl PlacementScore {
     }
 }
 
-const NUM_VARIANTS: usize = 10;
-
-/// Generate 10 placement variant configs with different seeds and strategies.
-pub fn generate_placement_configs() -> Vec<PlacementConfig> {
-    (0..NUM_VARIANTS as u64)
+/// Generate placement variant configs with different seeds and strategies.
+/// The number of variants and base spacing come from the options.
+pub fn generate_placement_configs(options: &Options) -> Vec<PlacementConfig> {
+    let n = options.placement_variants.max(1);
+    let base = options.spacing;
+    (0..n as u64)
         .map(|i| PlacementConfig {
             seed: i * 7919 + 42, // distinct primes for variety
-            spacing_mult: 1.0 + (i as f64 - 4.5) * 0.08, // range ~0.64..1.36
-            center_angle: (i as f64) * std::f64::consts::PI * 2.0 / NUM_VARIANTS as f64,
+            spacing_mult: base + (i as f64 - (n as f64 - 1.0) / 2.0) * 0.08,
+            center_angle: (i as f64) * std::f64::consts::PI * 2.0 / n as f64,
         })
         .collect()
+}
+
+/// Public wrapper to compute optimal board dimensions (for validation/display).
+pub fn auto_size_board_pub(board: &mut Board) {
+    auto_size_board(board);
 }
 
 /// Generate a single placement variant: returns a Board with components placed.
@@ -334,7 +343,7 @@ fn place_components_with_config(board: &mut Board, config: &PlacementConfig) {
         return;
     }
 
-    auto_size_board_if_needed(board, margin);
+    auto_size_board(board);
 
     let mut rng = SimpleRng::new(config.seed);
 
@@ -481,23 +490,20 @@ fn place_components_with_config(board: &mut Board, config: &PlacementConfig) {
     post_place_decoupling_near_ics(board);
 }
 
-/// Auto-calculate board dimensions if not specified (width or height == 0).
-/// Estimates from total component area.
-fn auto_size_board_if_needed(board: &mut Board, margin: f64) {
-    if board.width > 0.0 && board.height > 0.0 {
-        return;
-    }
-
+/// Auto-calculate optimal board dimensions from component courtyard areas,
+/// the density factor, and the desired aspect ratio.
+///
+/// Formula:
+///   board_area = sum(courtyard_areas) * density
+///   width  = sqrt(board_area * aspect_ratio)
+///   height = board_area / width
+fn auto_size_board(board: &mut Board) {
     let sizes = compute_placement_sizes(&board.components);
-    let total_area: f64 = sizes.iter().map(|(w, h)| w * h).sum();
-    let side = (total_area * 3.0).sqrt().max(30.0);
-    if board.width <= 0.0 {
-        board.width = side;
-    }
-    if board.height <= 0.0 {
-        board.height = side * 0.75;
-    }
-    let _ = margin; // used by callers for placement margins
+    let total_courtyard_area: f64 = sizes.iter().map(|(w, h)| w * h).sum();
+    let board_area = (total_courtyard_area * board.options.density).max(400.0); // min 20x20
+    let ar = board.aspect_ratio.max(0.1);
+    board.width = (board_area * ar).sqrt().max(20.0);
+    board.height = (board_area / board.width).max(20.0);
 }
 
 /// Find a non-overlapping position near (tx, ty) using spiral search.

@@ -406,15 +406,16 @@ async fn run_build(state: SharedState, tx: tokio::sync::mpsc::Sender<String>) {
         return;
     }
 
-    // Generate 10 placement variants and route each
+    // Generate placement variants and route each
+    let num_variants = board.options.placement_variants;
     update_status!("Generating placement variants...", 10);
-    let configs = pcb::generate_placement_configs();
+    let configs = pcb::generate_placement_configs(&board.options);
     let mut all_variants: Vec<PlacementVariant> = Vec::new();
 
     for (i, config) in configs.iter().enumerate() {
-        let progress = 10 + (i as u8) * 7; // 10-80%
+        let progress = 10 + ((i as f64 / num_variants as f64) * 70.0) as u8;
         update_status!(
-            &format!("Placing & routing variant {}/10...", i + 1),
+            &format!("Placing & routing variant {}/{}...", i + 1, num_variants),
             progress
         );
 
@@ -429,7 +430,7 @@ async fn run_build(state: SharedState, tx: tokio::sync::mpsc::Sender<String>) {
             r.route_all(&placed_board)
         };
 
-        let score = pcb::PlacementScore::compute(&routed_nets, board.nets.len());
+        let score = pcb::PlacementScore::compute(&routed_nets, board.nets.len(), &placed_board);
         all_variants.push(PlacementVariant {
             board: placed_board,
             routed_nets,

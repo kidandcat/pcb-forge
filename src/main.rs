@@ -121,9 +121,10 @@ fn build(input: &PathBuf, output: &PathBuf, use_topola: bool, open_viewer: bool)
     schematic::generate_schematic(&board, &sch_path)?;
     println!("  → {}", sch_path.display());
 
-    // Step 3: Generate 10 placement variants
-    println!("[3/7] Generating 10 placement variants...");
-    let configs = pcb::generate_placement_configs();
+    // Step 3: Generate placement variants
+    let num_variants = board.options.placement_variants;
+    println!("[3/7] Generating {} placement variants...", num_variants);
+    let configs = pcb::generate_placement_configs(&board.options);
     let mut variants: Vec<(
         pcb::PlacementConfig,
         pcb_forge::schema::Board,
@@ -133,7 +134,7 @@ fn build(input: &PathBuf, output: &PathBuf, use_topola: bool, open_viewer: bool)
 
     for (i, config) in configs.iter().enumerate() {
         let placed_board = pcb::generate_placement(&board, config);
-        print!("  variant {}/10: placing...", i + 1);
+        print!("  variant {}/{}: placing...", i + 1, num_variants);
 
         // Step 4: Route each variant
         let routed_nets = if use_topola {
@@ -151,7 +152,7 @@ fn build(input: &PathBuf, output: &PathBuf, use_topola: bool, open_viewer: bool)
             router.route_all(&placed_board)
         };
 
-        let score = pcb::PlacementScore::compute(&routed_nets, board.nets.len());
+        let score = pcb::PlacementScore::compute(&routed_nets, board.nets.len(), &placed_board);
         println!(
             " score={:.0} (nets={}/{}, length={:.1}mm, vias={})",
             score.composite, score.nets_routed, score.total_nets,
@@ -305,10 +306,14 @@ fn launch_ui(input: &PathBuf, output: &PathBuf, use_topola: bool, port: u16) -> 
 fn validate(input: &PathBuf) -> Result<()> {
     println!("Validating: {}", input.display());
 
-    let board = parser::parse_circuit(input).context("Failed to parse circuit")?;
+    let mut board = parser::parse_circuit(input).context("Failed to parse circuit")?;
+
+    // Compute auto-sized dimensions for display
+    pcb::auto_size_board_pub(&mut board);
 
     println!("Valid circuit definition:");
-    println!("  Board: {}mm x {}mm, {} layers", board.width, board.height, board.layers);
+    println!("  Board: {:.1}mm x {:.1}mm (auto-sized, aspect_ratio={:.1}), {} layers",
+        board.width, board.height, board.aspect_ratio, board.layers);
     println!("  Components: {}", board.components.len());
     for comp in &board.components {
         println!(

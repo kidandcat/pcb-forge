@@ -2,11 +2,23 @@
 # ESP32-S3 + LoRa + LTE Gateway
 
 [board]
-width = 80.0    # mm
-height = 60.0   # mm
+aspect_ratio = 1.3  # landscape (width/height ratio), 1.0 = square
 layers = 2
 trace_width = 0.25  # mm
 clearance = 0.2     # mm
+
+# ──────────────────────────────────────
+# AI-tunable options
+# ──────────────────────────────────────
+# Adjust these after reviewing placement results to optimize the design.
+[options]
+density = 2.0             # Courtyard area multiplier for board sizing (1.5=tight, 2.5=spacious)
+spacing = 1.0             # Base component spacing multiplier (0.5=tight, 2.0=spread)
+placement_variants = 10   # Number of placement variants to generate (1-50)
+board_penalty = 0.5       # Score penalty per mm² board area (favors smaller boards)
+trace_penalty = 0.1       # Score penalty per mm trace length (favors shorter traces)
+via_penalty = 50.0        # Score penalty per via (favors fewer layer changes)
+net_reward = 1000.0       # Score reward per routed net
 
 # ──────────────────────────────────────
 # Components

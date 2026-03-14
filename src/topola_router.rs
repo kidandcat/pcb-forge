@@ -472,7 +472,7 @@ fn extract_traces(
 mod tests {
     use super::*;
     use crate::footprint::{FootprintData, PadData};
-    use crate::schema::{Board, Component, Net, Pin, PinRef, PinType};
+    use crate::schema::{Board, Component, Net, Options, Pin, PinRef, PinType};
 
     /// Create a minimal board for DSN testing.
     fn make_test_board() -> Board {
@@ -491,9 +491,11 @@ mod tests {
         Board {
             width: 30.0,
             height: 20.0,
+            aspect_ratio: 1.5,
             layers: 2,
             trace_width: 0.25,
             clearance: 0.25,
+            options: Options::default(),
             components: vec![
                 Component {
                     ref_des: "U1".to_string(),

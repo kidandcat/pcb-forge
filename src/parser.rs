@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::path::Path;
 
 use crate::footprint;
-use crate::schema::*;
+use crate::schema::{self, *};
 
 /// Default KiCad footprint library paths to try (in order).
 const DEFAULT_LIB_PATHS: &[&str] = &[
@@ -196,14 +196,18 @@ fn build_board(def: CircuitDefinition) -> Result<Board> {
         }
     }
 
+    let options = schema::Options::from(&def.options);
+
     Ok(Board {
-        width: def.board.width.unwrap_or(0.0),
-        height: def.board.height.unwrap_or(0.0),
+        width: 0.0,  // auto-calculated during placement
+        height: 0.0, // auto-calculated during placement
+        aspect_ratio: def.board.aspect_ratio,
         layers: def.board.layers,
         trace_width: def.board.trace_width,
         clearance: def.board.clearance,
         components,
         nets,
+        options,
     })
 }
 

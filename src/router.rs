@@ -857,7 +857,7 @@ fn merge_collinear_segments(segments: Vec<TraceSegment>) -> Vec<TraceSegment> {
 mod tests {
     use super::*;
     use crate::footprint::{FootprintData, PadData};
-    use crate::schema::{Board, Component, Net, Pin, PinRef, PinType};
+    use crate::schema::{Board, Component, Net, Options, Pin, PinRef, PinType};
 
     const MIN_CLEARANCE: f64 = 0.2;
 
@@ -1033,9 +1033,11 @@ mod tests {
         Board {
             width: 20.0,
             height: 20.0,
+            aspect_ratio: 1.0,
             layers: 2,
             trace_width: 0.25,
             clearance: 0.25,
+            options: Options::default(),
             components: vec![
                 Component {
                     ref_des: "R1".to_string(),
@@ -1154,9 +1156,11 @@ mod tests {
         let board = Board {
             width: 20.0,
             height: 20.0,
+            aspect_ratio: 1.0,
             layers: 2,
             trace_width: 0.25,
             clearance: 0.25,
+            options: Options::default(),
             components: vec![
                 Component {
                     ref_des: "R1".to_string(),

@@ -12,14 +12,14 @@ pub struct CircuitDefinition {
     pub nets: Vec<NetDef>,
     #[serde(default)]
     pub power: Option<PowerDef>,
+    #[serde(default)]
+    pub options: OptionsDef,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct BoardDef {
-    #[serde(default)]
-    pub width: Option<f64>,
-    #[serde(default)]
-    pub height: Option<f64>,
+    #[serde(default = "default_aspect_ratio")]
+    pub aspect_ratio: f64,
     #[serde(default = "default_layers")]
     pub layers: u32,
     #[serde(default = "default_trace_width")]
@@ -30,6 +30,9 @@ pub struct BoardDef {
     pub footprint_lib: Option<String>,
 }
 
+fn default_aspect_ratio() -> f64 {
+    1.0
+}
 fn default_layers() -> u32 {
     2
 }
@@ -39,6 +42,54 @@ fn default_trace_width() -> f64 {
 fn default_clearance() -> f64 {
     0.25
 }
+
+/// AI-tunable options for placement and scoring.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OptionsDef {
+    /// Courtyard area multiplier for board sizing (1.5 = tight, 2.5 = spacious).
+    #[serde(default = "default_density")]
+    pub density: f64,
+    /// Base component spacing multiplier (0.5 = tight, 2.0 = spread).
+    #[serde(default = "default_spacing")]
+    pub spacing: f64,
+    /// Number of placement variants to generate and compare (1-50).
+    #[serde(default = "default_placement_variants")]
+    pub placement_variants: usize,
+    /// Score penalty per mm² of board area (higher = favors smaller boards).
+    #[serde(default = "default_board_penalty")]
+    pub board_penalty: f64,
+    /// Score penalty per mm of trace length (higher = favors shorter traces).
+    #[serde(default = "default_trace_penalty")]
+    pub trace_penalty: f64,
+    /// Score penalty per via (higher = favors fewer layer changes).
+    #[serde(default = "default_via_penalty")]
+    pub via_penalty: f64,
+    /// Score reward per successfully routed net.
+    #[serde(default = "default_net_reward")]
+    pub net_reward: f64,
+}
+
+impl Default for OptionsDef {
+    fn default() -> Self {
+        Self {
+            density: default_density(),
+            spacing: default_spacing(),
+            placement_variants: default_placement_variants(),
+            board_penalty: default_board_penalty(),
+            trace_penalty: default_trace_penalty(),
+            via_penalty: default_via_penalty(),
+            net_reward: default_net_reward(),
+        }
+    }
+}
+
+fn default_density() -> f64 { 2.0 }
+fn default_spacing() -> f64 { 1.0 }
+fn default_placement_variants() -> usize { 10 }
+fn default_board_penalty() -> f64 { 0.5 }
+fn default_trace_penalty() -> f64 { 0.1 }
+fn default_via_penalty() -> f64 { 50.0 }
+fn default_net_reward() -> f64 { 1000.0 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ComponentDef {
@@ -151,15 +202,49 @@ pub struct PinRef {
     pub pin: String,
 }
 
+/// Runtime options (mirrors OptionsDef after parsing).
+#[derive(Debug, Clone, Serialize)]
+pub struct Options {
+    pub density: f64,
+    pub spacing: f64,
+    pub placement_variants: usize,
+    pub board_penalty: f64,
+    pub trace_penalty: f64,
+    pub via_penalty: f64,
+    pub net_reward: f64,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self::from(&OptionsDef::default())
+    }
+}
+
+impl From<&OptionsDef> for Options {
+    fn from(def: &OptionsDef) -> Self {
+        Self {
+            density: def.density,
+            spacing: def.spacing,
+            placement_variants: def.placement_variants,
+            board_penalty: def.board_penalty,
+            trace_penalty: def.trace_penalty,
+            via_penalty: def.via_penalty,
+            net_reward: def.net_reward,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Board {
     pub width: f64,
     pub height: f64,
+    pub aspect_ratio: f64,
     pub layers: u32,
     pub trace_width: f64,
     pub clearance: f64,
     pub components: Vec<Component>,
     pub nets: Vec<Net>,
+    pub options: Options,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
