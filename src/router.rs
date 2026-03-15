@@ -17,8 +17,10 @@ const COST_DIRECTION_PENALTY: i32 = 15;
 const COST_VIA: i32 = 200;
 const COST_BEND: i32 = 5;
 
-const MAX_REROUTE_ATTEMPTS: usize = 3;
+const MAX_RIPUP_ITERATIONS: usize = 50;
 const MAX_ASTAR_ITERATIONS: usize = 500_000;
+const CONGESTION_MULTIPLIER: f64 = 40.0;
+const MAX_BLOCKERS_TO_RIP: usize = 5;
 
 /// Routing grid cell
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -82,10 +84,14 @@ pub struct Router {
     grid_height: i32,
     /// Cells blocked by pads/components
     pad_obstacles: HashSet<GridPoint>,
-    /// Cells blocked by routed traces (with clearance)
-    trace_obstacles: HashSet<GridPoint>,
+    /// Cells blocked by routed traces (ref-counted for correct rip-up)
+    trace_obstacles: HashMap<GridPoint, u32>,
     /// Map from net name to set of grid points that are pad locations for that net
     net_pads: HashMap<String, HashSet<GridPoint>>,
+    /// Exact path cells → owning net name (for blocker identification)
+    trace_ownership: HashMap<GridPoint, String>,
+    /// Cumulative congestion history (incremented each rip-up iteration)
+    congestion_history: HashMap<(i32, i32, u8), f64>,
 }
 
 fn mm_to_grid(mm: f64) -> i32 {
@@ -198,6 +204,19 @@ fn clearance_cells(trace_width: f64) -> i32 {
     (total / GRID_SIZE).ceil() as i32
 }
 
+/// Difficulty score for net ordering: harder nets (longer span, more pins) first
+fn net_difficulty(pin_positions: &[(f64, f64)]) -> f64 {
+    if pin_positions.len() < 2 {
+        return 0.0;
+    }
+    let min_x = pin_positions.iter().map(|p| p.0).fold(f64::MAX, f64::min);
+    let max_x = pin_positions.iter().map(|p| p.0).fold(f64::MIN, f64::max);
+    let min_y = pin_positions.iter().map(|p| p.1).fold(f64::MAX, f64::min);
+    let max_y = pin_positions.iter().map(|p| p.1).fold(f64::MIN, f64::max);
+    let span = (max_x - min_x) + (max_y - min_y);
+    span * pin_positions.len() as f64
+}
+
 impl Router {
     pub fn new(board_width: f64, board_height: f64, _grid_size: f64) -> Self {
         let grid_width = (board_width / GRID_SIZE).ceil() as i32 + 1;
@@ -207,8 +226,10 @@ impl Router {
             grid_width,
             grid_height,
             pad_obstacles: HashSet::new(),
-            trace_obstacles: HashSet::new(),
+            trace_obstacles: HashMap::new(),
             net_pads: HashMap::new(),
+            trace_ownership: HashMap::new(),
+            congestion_history: HashMap::new(),
         }
     }
 
@@ -272,59 +293,119 @@ impl Router {
         }
     }
 
-    /// Mark trace cells as occupied with clearance expansion
-    fn mark_trace_cells(&mut self, path: &[GridPoint], trace_width: f64) {
+    /// Mark trace cells as occupied with clearance expansion (ref-counted)
+    fn mark_trace_cells(&mut self, path: &[GridPoint], trace_width: f64, net_name: &str) {
         let cl = clearance_cells(trace_width);
         for &pt in path {
+            self.trace_ownership.insert(pt, net_name.to_string());
             for dx in -cl..=cl {
                 for dy in -cl..=cl {
-                    self.trace_obstacles.insert(GridPoint {
+                    *self.trace_obstacles.entry(GridPoint {
                         x: pt.x + dx,
                         y: pt.y + dy,
                         layer: pt.layer,
-                    });
+                    }).or_default() += 1;
                 }
             }
         }
     }
 
-    /// Remove trace cells for a previously routed path (for rip-up)
+    /// Remove trace cells for a previously routed path (ref-counted for correct rip-up)
     fn unmark_trace_cells(&mut self, path: &[GridPoint], trace_width: f64) {
         let cl = clearance_cells(trace_width);
         for &pt in path {
+            self.trace_ownership.remove(&pt);
             for dx in -cl..=cl {
                 for dy in -cl..=cl {
-                    self.trace_obstacles.remove(&GridPoint {
+                    let cell = GridPoint {
                         x: pt.x + dx,
                         y: pt.y + dy,
                         layer: pt.layer,
-                    });
+                    };
+                    if let Some(count) = self.trace_obstacles.get_mut(&cell) {
+                        if *count <= 1 {
+                            self.trace_obstacles.remove(&cell);
+                        } else {
+                            *count -= 1;
+                        }
+                    }
                 }
             }
         }
     }
 
-    /// Check if a grid point is valid for routing a specific net
+    /// Check if a grid point is valid for routing a specific net.
+    /// Own pad cells are ALWAYS passable (trace clearance from nearby nets
+    /// doesn't prevent connecting to our own pads).
     fn is_valid_for_net(&self, point: GridPoint, net_name: &str) -> bool {
         if point.x < 0 || point.x >= self.grid_width || point.y < 0 || point.y >= self.grid_height
         {
             return false;
         }
 
-        if self.trace_obstacles.contains(&point) {
+        // Own pad cells are always reachable — even if covered by another
+        // net's trace clearance zone. The pad physically exists regardless;
+        // routing to it doesn't worsen any clearance situation.
+        if let Some(net_set) = self.net_pads.get(net_name) {
+            if net_set.contains(&point) {
+                return true;
+            }
+        }
+
+        if self.trace_obstacles.contains_key(&point) {
             return false;
         }
 
         if self.pad_obstacles.contains(&point) {
-            if let Some(net_set) = self.net_pads.get(net_name) {
-                if net_set.contains(&point) {
-                    return true;
-                }
-            }
             return false;
         }
 
         true
+    }
+
+    /// Identify which routed nets block a failed net by checking trace ownership
+    /// within the bounding box of the failed net's pins.
+    fn find_blocking_nets(&self, pin_positions: &[(f64, f64)], net_name: &str) -> Vec<String> {
+        let (mut min_x, mut min_y) = (i32::MAX, i32::MAX);
+        let (mut max_x, mut max_y) = (i32::MIN, i32::MIN);
+        for &(px, py) in pin_positions {
+            let gx = mm_to_grid(px);
+            let gy = mm_to_grid(py);
+            min_x = min_x.min(gx);
+            max_x = max_x.max(gx);
+            min_y = min_y.min(gy);
+            max_y = max_y.max(gy);
+        }
+        // Expand bounding box by margin (~5mm)
+        let margin = 20;
+        min_x -= margin;
+        max_x += margin;
+        min_y -= margin;
+        max_y += margin;
+
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for (&pt, owner) in &self.trace_ownership {
+            if owner != net_name
+                && pt.x >= min_x
+                && pt.x <= max_x
+                && pt.y >= min_y
+                && pt.y <= max_y
+            {
+                *counts.entry(owner.clone()).or_default() += 1;
+            }
+        }
+
+        let mut result: Vec<_> = counts.into_iter().collect();
+        result.sort_by(|a, b| b.1.cmp(&a.1)); // Most blocking first
+        result.into_iter().map(|(name, _)| name).collect()
+    }
+
+    /// Additional A* cost for congested cells
+    fn congestion_cost(&self, point: GridPoint) -> i32 {
+        self.congestion_history
+            .get(&(point.x, point.y, point.layer))
+            .map(|&h| (h * CONGESTION_MULTIPLIER) as i32)
+            .unwrap_or(0)
     }
 
     /// Route all nets using real pad positions from footprint data.
@@ -415,8 +496,8 @@ impl Router {
             });
         }
 
-        // Step 4: Sort nets — critical first (TVS→connector, decoupling→IC),
-        // then signal nets, then power nets
+        // Step 4: Sort nets — critical first, then signal by difficulty (harder first),
+        // then power nets last
         net_infos.sort_by(|a, b| {
             let a_critical = is_critical_net(&a.name, board);
             let b_critical = is_critical_net(&b.name, board);
@@ -425,28 +506,32 @@ impl Router {
             b_critical
                 .cmp(&a_critical) // critical nets first (true > false)
                 .then_with(|| a_power.cmp(&b_power)) // power nets last
-                .then_with(|| a.pin_positions.len().cmp(&b.pin_positions.len()))
+                .then_with(|| {
+                    // Within same tier, harder nets first (longer span, more pins)
+                    let a_diff = net_difficulty(&a.pin_positions);
+                    let b_diff = net_difficulty(&b.pin_positions);
+                    b_diff
+                        .partial_cmp(&a_diff)
+                        .unwrap_or(Ordering::Equal)
+                })
         });
 
-        // Step 5: Route each net
+        let total = net_infos.len();
+
+        // Step 5: Initial routing pass
         let mut routed: Vec<RoutedNet> = Vec::new();
-        let mut routed_paths: Vec<(String, Vec<Vec<GridPoint>>, f64)> = Vec::new();
+        let mut routed_paths: HashMap<String, (Vec<Vec<GridPoint>>, f64)> = HashMap::new();
         let mut unrouted: Vec<String> = Vec::new();
 
         for net_info in &net_infos {
-            let result = self.route_net(
+            match self.route_net(
                 &net_info.name,
                 &net_info.pin_positions,
                 net_info.trace_width,
-            );
-
-            match result {
+            ) {
                 Some((routed_net, paths)) => {
-                    routed_paths.push((
-                        net_info.name.clone(),
-                        paths,
-                        net_info.trace_width,
-                    ));
+                    routed_paths
+                        .insert(net_info.name.clone(), (paths, net_info.trace_width));
                     routed.push(routed_net);
                 }
                 None => {
@@ -455,18 +540,33 @@ impl Router {
             }
         }
 
-        // Step 6: Rip-up and reroute for failed nets
-        for attempt in 0..MAX_REROUTE_ATTEMPTS {
+        eprintln!("  Initial: {}/{} nets routed", routed.len(), total);
+
+        if unrouted.is_empty() {
+            return routed;
+        }
+
+        // Step 6: Rip-up & retry with congestion escalation
+        let mut best_routed: Vec<RoutedNet> = routed.clone();
+        let mut best_count = routed.len();
+        let mut stagnation_count = 0u32;
+
+        for iteration in 0..MAX_RIPUP_ITERATIONS {
             if unrouted.is_empty() {
                 break;
             }
 
-            eprintln!(
-                "  Rip-up attempt {}/{}: {} unrouted nets",
-                attempt + 1,
-                MAX_REROUTE_ATTEMPTS,
-                unrouted.len()
-            );
+            // Update congestion map from current routing
+            for (_, (paths, _)) in &routed_paths {
+                for path in paths {
+                    for &pt in path {
+                        *self
+                            .congestion_history
+                            .entry((pt.x, pt.y, pt.layer))
+                            .or_default() += 1.0;
+                    }
+                }
+            }
 
             let failed = std::mem::take(&mut unrouted);
 
@@ -474,121 +574,186 @@ impl Router {
                 let net_info = net_infos.iter().find(|n| &n.name == net_name).unwrap();
                 let mut succeeded = false;
 
-                // Try without rip-up first (maybe space freed up)
-                if let Some((routed_net, paths)) = self.route_net(
+                // Try without rip-up (congestion costs may have shifted things)
+                if let Some((rn, paths)) = self.route_net(
                     &net_info.name,
                     &net_info.pin_positions,
                     net_info.trace_width,
                 ) {
-                    routed_paths.push((net_info.name.clone(), paths, net_info.trace_width));
-                    routed.push(routed_net);
+                    routed_paths
+                        .insert(net_info.name.clone(), (paths, net_info.trace_width));
+                    routed.push(rn);
                     succeeded = true;
                 }
 
                 if !succeeded {
-                    // Rip up each previously routed net, try routing this one,
-                    // then re-route the ripped net
-                    let mut rip_candidates: Vec<usize> = (0..routed_paths.len()).collect();
-                    rip_candidates.sort_by(|&a, &b| {
-                        let len_a: usize = routed_paths[a].1.iter().map(|p| p.len()).sum();
-                        let len_b: usize = routed_paths[b].1.iter().map(|p| p.len()).sum();
-                        len_b.cmp(&len_a)
-                    });
+                    // Identify blocking nets and rip up the worst offenders
+                    let blockers =
+                        self.find_blocking_nets(&net_info.pin_positions, &net_info.name);
+                    let to_rip: Vec<String> =
+                        blockers.into_iter().take(MAX_BLOCKERS_TO_RIP).collect();
 
-                    for &rip_idx in &rip_candidates {
-                        let rip_name = routed_paths[rip_idx].0.clone();
-                        let rip_width = routed_paths[rip_idx].2;
+                    if to_rip.is_empty() {
+                        unrouted.push(net_name.clone());
+                        continue;
+                    }
 
-                        // Unmark ripped net's traces
-                        for path in &routed_paths[rip_idx].1 {
-                            self.unmark_trace_cells(path, rip_width);
+                    // Rip up blocking nets (save for rollback)
+                    let mut ripped: Vec<(String, Vec<Vec<GridPoint>>, f64, RoutedNet)> =
+                        Vec::new();
+                    for rip_name in &to_rip {
+                        if let Some((paths, tw)) = routed_paths.remove(rip_name) {
+                            for path in &paths {
+                                self.unmark_trace_cells(path, tw);
+                            }
+                            if let Some(idx) =
+                                routed.iter().position(|r| r.name == *rip_name)
+                            {
+                                let rn = routed.remove(idx);
+                                ripped.push((rip_name.clone(), paths, tw, rn));
+                            }
                         }
+                    }
 
-                        // Try routing our net
-                        if let Some((new_routed, new_paths)) = self.route_net(
-                            &net_info.name,
-                            &net_info.pin_positions,
-                            net_info.trace_width,
-                        ) {
-                            // Try re-routing the ripped net
+                    // Try routing the failed net in the freed space
+                    if let Some((rn, paths)) = self.route_net(
+                        &net_info.name,
+                        &net_info.pin_positions,
+                        net_info.trace_width,
+                    ) {
+                        routed_paths.insert(
+                            net_info.name.clone(),
+                            (paths, net_info.trace_width),
+                        );
+                        routed.push(rn);
+
+                        // Re-route the ripped nets (they should find alternative paths)
+                        for (rip_name, _old_paths, rip_tw, _old_rn) in ripped {
                             let rip_info =
                                 net_infos.iter().find(|n| n.name == rip_name).unwrap();
-                            if let Some((rip_routed, rip_new_paths)) = self.route_net(
+                            if let Some((re_rn, re_paths)) = self.route_net(
                                 &rip_info.name,
                                 &rip_info.pin_positions,
                                 rip_info.trace_width,
                             ) {
-                                // Both succeeded
-                                routed_paths[rip_idx] =
-                                    (rip_name.clone(), rip_new_paths, rip_width);
-                                if let Some(r) =
-                                    routed.iter_mut().find(|r| r.name == rip_name)
-                                {
-                                    *r = rip_routed;
-                                }
-                                routed_paths.push((
-                                    net_info.name.clone(),
-                                    new_paths,
-                                    net_info.trace_width,
-                                ));
-                                routed.push(new_routed);
-                                succeeded = true;
-                                break;
+                                routed_paths
+                                    .insert(rip_name, (re_paths, rip_tw));
+                                routed.push(re_rn);
                             } else {
-                                // Undo - remove our traces, re-mark ripped
-                                for path in &new_paths {
-                                    self.unmark_trace_cells(path, net_info.trace_width);
-                                }
-                                for path in &routed_paths[rip_idx].1 {
-                                    self.mark_trace_cells(path, rip_width);
-                                }
-                            }
-                        } else {
-                            // Re-mark ripped net
-                            for path in &routed_paths[rip_idx].1 {
-                                self.mark_trace_cells(path, rip_width);
+                                unrouted.push(rip_name);
                             }
                         }
+                    } else {
+                        // Rollback: restore all ripped nets
+                        for (rip_name, old_paths, rip_tw, old_rn) in ripped {
+                            for path in &old_paths {
+                                self.mark_trace_cells(path, rip_tw, &rip_name);
+                            }
+                            routed_paths
+                                .insert(rip_name, (old_paths, rip_tw));
+                            routed.push(old_rn);
+                        }
+                        unrouted.push(net_name.clone());
                     }
                 }
+            }
 
-                if !succeeded {
-                    unrouted.push(net_name.clone());
-                }
+            // Track best result
+            if routed.len() > best_count {
+                best_routed = routed.clone();
+                best_count = routed.len();
+                stagnation_count = 0;
+            } else {
+                stagnation_count += 1;
+            }
+
+            eprintln!(
+                "  Rip-up iteration {}/{}: {}/{} nets routed (best: {}/{})",
+                iteration + 1,
+                MAX_RIPUP_ITERATIONS,
+                routed.len(),
+                total,
+                best_count,
+                total
+            );
+
+            if stagnation_count >= 8 {
+                break; // No more progress possible
             }
         }
 
-        // Step 7: Report unrouted nets
-        for net_name in &unrouted {
-            eprintln!("WARNING: Net '{}' could not be routed!", net_name);
+        // Step 7: Use best result, report unrouted
+        let routed_names: HashSet<String> =
+            best_routed.iter().map(|r| r.name.clone()).collect();
+        for net_info in &net_infos {
+            if !routed_names.contains(&net_info.name) {
+                eprintln!("WARNING: Net '{}' could not be routed!", net_info.name);
+                best_routed.push(RoutedNet {
+                    name: net_info.name.clone(),
+                    segments: Vec::new(),
+                    vias: Vec::new(),
+                });
+            }
         }
 
-        // Push empty RoutedNet for unrouted (NO partial traces)
-        for net_name in &unrouted {
-            routed.push(RoutedNet {
-                name: net_name.clone(),
-                segments: Vec::new(),
-                vias: Vec::new(),
-            });
-        }
+        eprintln!(
+            "  Routing complete: {}/{} nets routed ({} rip-up iterations used)",
+            best_count,
+            total,
+            self.congestion_history.len().min(MAX_RIPUP_ITERATIONS)
+        );
 
-        routed
+        best_routed
     }
 
-    /// Route a single net using MST ordering. Returns None if any connection fails.
+    /// Route a single net. For multi-pin signal nets, tries different MST start pins.
+    /// Power nets allow partial routing (copper pour handles the rest).
     fn route_net(
         &mut self,
         net_name: &str,
         pin_positions: &[(f64, f64)],
         trace_width: f64,
     ) -> Option<(RoutedNet, Vec<Vec<GridPoint>>)> {
+        let is_power = is_power_net(net_name);
+
+        // For multi-pin signal nets, try different MST start pins
+        let max_starts = if !is_power && pin_positions.len() > 2 {
+            pin_positions.len().min(4)
+        } else {
+            1
+        };
+
+        for start_idx in 0..max_starts {
+            if let Some(result) =
+                self.route_net_from(net_name, pin_positions, trace_width, start_idx, is_power)
+            {
+                return Some(result);
+            }
+        }
+        None
+    }
+
+    /// Try routing a net using Prim's MST starting from a specific pin.
+    fn route_net_from(
+        &mut self,
+        net_name: &str,
+        pin_positions: &[(f64, f64)],
+        trace_width: f64,
+        start_idx: usize,
+        allow_partial: bool,
+    ) -> Option<(RoutedNet, Vec<Vec<GridPoint>>)> {
         let mut segments = Vec::new();
         let mut vias = Vec::new();
         let mut all_paths: Vec<Vec<GridPoint>> = Vec::new();
 
-        // Prim's MST ordering
-        let mut connected: Vec<(f64, f64)> = vec![pin_positions[0]];
-        let mut remaining: Vec<(f64, f64)> = pin_positions[1..].to_vec();
+        // Prim's MST ordering from start_idx
+        let mut connected: Vec<(f64, f64)> = vec![pin_positions[start_idx]];
+        let mut remaining: Vec<(f64, f64)> = pin_positions
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| i != start_idx)
+            .map(|(_, &p)| p)
+            .collect();
 
         while !remaining.is_empty() {
             let mut best_dist = f64::MAX;
@@ -631,18 +796,26 @@ impl Router {
                         }
                     }
 
-                    self.mark_trace_cells(&path, trace_width);
+                    self.mark_trace_cells(&path, trace_width, net_name);
                     all_paths.push(path);
                     connected.push(target);
                 }
                 None => {
-                    // Failed - undo ALL traces for this net (no partial traces)
+                    if allow_partial {
+                        // Power nets: skip failed connection (copper pour handles it)
+                        continue;
+                    }
+                    // Signal nets: undo ALL traces (no partial routing)
                     for path in &all_paths {
                         self.unmark_trace_cells(path, trace_width);
                     }
                     return None;
                 }
             }
+        }
+
+        if all_paths.is_empty() {
+            return None;
         }
 
         let segments = merge_collinear_segments(segments);
@@ -772,6 +945,9 @@ impl Router {
                     }
                 }
 
+                // Congestion cost: penalize cells used in previous iterations
+                move_cost += self.congestion_cost(neighbor);
+
                 let tentative_g = current_g + move_cost;
                 if tentative_g < *g_score.get(&neighbor).unwrap_or(&i32::MAX) {
                     came_from.insert(neighbor, current.point);
@@ -794,7 +970,7 @@ impl Router {
                 layer: other_layer,
             };
             if self.is_valid_for_net(via_point, net_name) {
-                let tentative_g = current_g + COST_VIA;
+                let tentative_g = current_g + COST_VIA + self.congestion_cost(via_point);
                 if tentative_g < *g_score.get(&via_point).unwrap_or(&i32::MAX) {
                     came_from.insert(via_point, current.point);
                     g_score.insert(via_point, tentative_g);
@@ -919,7 +1095,7 @@ mod tests {
         ];
 
         assert!(router.trace_obstacles.is_empty());
-        router.mark_trace_cells(&path, TRACE_WIDTH_SIGNAL);
+        router.mark_trace_cells(&path, TRACE_WIDTH_SIGNAL, "TEST_NET");
         assert!(!router.trace_obstacles.is_empty());
         router.unmark_trace_cells(&path, TRACE_WIDTH_SIGNAL);
         assert!(
